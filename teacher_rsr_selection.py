@@ -14,7 +14,13 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
-from rsr_core import compute_sample_metrics, infer_dataset, load_model_and_tokenizer
+from rsr_core import (
+    compute_gradient_baseline_metrics,
+    compute_sample_metrics,
+    extract_processed_gradients,
+    infer_dataset,
+    load_model_and_tokenizer,
+)
 
 
 def sanitize_name(value: str) -> str:
@@ -226,6 +232,39 @@ def write_tsv(path: Path, rows: Sequence[Dict]) -> None:
             handle.write("\t".join(str(row.get(header, "")) for header in headers) + "\n")
 
 
+SELECTION_SCORE_KEYS = {
+    "rsr": "rank_surprisal_ratio",
+    "grace": "grace",
+    "g_norm": "g_norm",
+    "g_vendi": "g_vendi",
+}
+
+SELECTION_LABELS = {
+    "rsr": "RSR",
+    "grace": "GRACE",
+    "g_norm": "G-Norm",
+    "g_vendi": "G-Vendi",
+}
+
+DESCENDING_SELECTION_METRICS = {"g_vendi"}
+
+
+def uses_gradient_baseline(selection_metric: str) -> bool:
+    return selection_metric in {"grace", "g_norm", "g_vendi"}
+
+
+def selection_score_key(selection_metric: str) -> str:
+    return SELECTION_SCORE_KEYS[selection_metric]
+
+
+def selection_label(selection_metric: str) -> str:
+    return SELECTION_LABELS[selection_metric]
+
+
+def selection_objective(selection_metric: str) -> str:
+    return "max" if selection_metric in DESCENDING_SELECTION_METRICS else "min"
+
+
 def load_dataset_info(dataset_info_path: Path) -> Dict[str, Dict]:
     if not dataset_info_path.exists():
         return {}
@@ -267,18 +306,24 @@ def run_worker(manifest_path: Path) -> None:
     jobs = manifest["jobs"]
     worker_index = manifest["worker_index"]
     output_root = Path(manifest["output_root"])
+    selection_metric = manifest["selection_metric"]
+    score_key = selection_score_key(selection_metric)
+    metric_label = selection_label(selection_metric)
     output_root.mkdir(parents=True, exist_ok=True)
 
     print(
         f"[worker {worker_index}] starting with {len(jobs)} teacher files on "
         f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '') or '<cpu>'}"
     )
+    if uses_gradient_baseline(selection_metric) and manifest["batch_size"] != 1:
+        raise ValueError(f"{metric_label} requires --batch-size 1 because gradients are computed per sample")
+
     model, tokenizer = load_model_and_tokenizer(
         model_path=manifest["model_path"],
         dtype=manifest["dtype"],
         use_flash_attn=manifest["use_flash_attn"],
         chat_template=manifest["chat_template"],
-        device_map="auto" if torch.cuda.is_available() else None,
+        device_map=None if uses_gradient_baseline(selection_metric) else ("auto" if torch.cuda.is_available() else None),
     )
 
     results = []
@@ -287,26 +332,46 @@ def run_worker(manifest_path: Path) -> None:
         prepared_path = Path(job["prepared_path"])
         sample_metrics_path = output_root / "sample_metrics" / f"{sanitize_name(teacher_name)}.jsonl"
 
-        print(f"[worker {worker_index}] scoring {teacher_name}")
+        print(f"[worker {worker_index}] scoring {teacher_name} with {metric_label}")
         t0 = time.perf_counter()
-        inferred_samples = infer_dataset(
-            model=model,
-            tokenizer=tokenizer,
-            json_path=prepared_path,
-            batch_size=manifest["batch_size"],
-            max_model_len=manifest["max_model_len"],
-            rank_clip_r=manifest["rank_clip_r"],
-            chat_template=manifest["chat_template"],
-        )
-        infer_seconds = time.perf_counter() - t0
-        dataset_metrics, sample_metrics = compute_sample_metrics(
-            inferred_samples=inferred_samples,
-            rank_clip_r=manifest["rank_clip_r"],
-        )
+        if uses_gradient_baseline(selection_metric):
+            processed_gradients, sample_metrics = extract_processed_gradients(
+                model=model,
+                tokenizer=tokenizer,
+                json_path=prepared_path,
+                max_model_len=manifest["max_model_len"],
+                chat_template=manifest["chat_template"],
+                projection_dim=manifest["grace_projection_dim"],
+                projection_seed=manifest["grace_projection_seed"],
+                projection_chunk_size=manifest["grace_projection_chunk_size"],
+            )
+            infer_seconds = time.perf_counter() - t0
+            dataset_metrics = compute_gradient_baseline_metrics(
+                processed_gradients=processed_gradients,
+                response_lengths=[row["resp_token_length"] for row in sample_metrics],
+                num_partitions=manifest["grace_num_partitions"],
+                smoothing=manifest["grace_smoothing"],
+                partition_seed=manifest["seed"],
+            )
+        else:
+            inferred_samples = infer_dataset(
+                model=model,
+                tokenizer=tokenizer,
+                json_path=prepared_path,
+                batch_size=manifest["batch_size"],
+                max_model_len=manifest["max_model_len"],
+                rank_clip_r=manifest["rank_clip_r"],
+                chat_template=manifest["chat_template"],
+            )
+            infer_seconds = time.perf_counter() - t0
+            dataset_metrics, sample_metrics = compute_sample_metrics(
+                inferred_samples=inferred_samples,
+                rank_clip_r=manifest["rank_clip_r"],
+            )
         write_jsonl(sample_metrics_path, sample_metrics)
 
         if not dataset_metrics:
-            raise RuntimeError(f"{teacher_name}: no valid RSR metrics were produced")
+            raise RuntimeError(f"{teacher_name}: no valid {metric_label} metrics were produced")
 
         result_row = {
             "teacher_name": teacher_name,
@@ -316,6 +381,10 @@ def run_worker(manifest_path: Path) -> None:
             "sample_count": job["sample_count"],
             "infer_seconds": round(infer_seconds, 6),
             "worker_index": worker_index,
+            "selection_metric": selection_metric,
+            "selection_score_key": score_key,
+            "selection_objective": selection_objective(selection_metric),
+            "selection_score": dataset_metrics[score_key],
             **dataset_metrics,
         }
         results.append(result_row)
@@ -327,26 +396,61 @@ def run_worker(manifest_path: Path) -> None:
 
 def build_controller_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Sample a shared subset across teacher JSONL files, compute RSR for each teacher, and rank them."
+        description="Sample a shared subset across teacher JSONL files, score each teacher with RSR or gradient baselines, and rank them."
     )
     parser.add_argument("--teacher-folder", required=True, help="Folder containing one teacher JSONL/JSON file per teacher.")
     parser.add_argument("--model-path", required=True, help="HF model name or local path for the student model.")
     parser.add_argument("--model-name", default="", help="Optional display name for the student model.")
     parser.add_argument("--output-root", default="", help="Folder for ranking outputs, prepared messages, logs, and manifests.")
     parser.add_argument("--dataset-info-path", default="dataset/dataset_info.json")
-    parser.add_argument("--dataset-export-dir", default="dataset/rsr_selected_teachers")
+    parser.add_argument(
+        "--dataset-export-dir",
+        default="",
+        help="Where the winning full teacher file is copied. Defaults to dataset/<metric>_selected_teachers.",
+    )
     parser.add_argument("--dataset-entry-name", default="", help="Optional dataset_info key for the selected teacher copy.")
     parser.add_argument("--teacher-glob", default="*.jsonl", help="Glob used to discover teacher files.")
     parser.add_argument("--id-field", default="id")
     parser.add_argument("--system-field", default="system")
     parser.add_argument("--prompt-field", default="instruction")
     parser.add_argument("--response-field", default="teacher_output")
+    parser.add_argument(
+        "--selection-metric",
+        default="rsr",
+        choices=["rsr", "grace", "g_norm", "g_vendi"],
+        help="Teacher-selection score: token-level RSR, dataset-level GRACE, or GRACE paper baselines.",
+    )
     parser.add_argument("--sample-size", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32", "auto"])
     parser.add_argument("--chat-template", default="qwen", choices=["qwen", "llama3"])
     parser.add_argument("--rank-clip-r", type=int, default=100)
+    parser.add_argument(
+        "--grace-projection-dim",
+        type=int,
+        default=512,
+        help="Projected gradient dimension d used by GRACE / G-Norm / G-Vendi.",
+    )
+    parser.add_argument("--grace-projection-seed", type=int, default=-1, help="Defaults to --seed when set to -1.")
+    parser.add_argument(
+        "--grace-projection-chunk-size",
+        type=int,
+        default=1_048_576,
+        help="Chunk size for the streaming sparse random projection over model parameters.",
+    )
+    parser.add_argument(
+        "--grace-num-partitions",
+        type=int,
+        default=10,
+        help="Cross-validation fold count C for GRACE. Effective value is capped by sample size.",
+    )
+    parser.add_argument(
+        "--grace-smoothing",
+        type=float,
+        default=1e-4,
+        help="Smoothing coefficient nu used in hat{Sigma}=tilde{Sigma}+nu/d*I.",
+    )
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--use-flash-attn", action="store_true")
     parser.add_argument("--gpus-per-worker", type=int, default=1)
@@ -358,6 +462,9 @@ def build_controller_arg_parser() -> argparse.ArgumentParser:
 
 def run_controller(args: argparse.Namespace) -> None:
     model_name = derive_model_name(args.model_name, args.model_path)
+    score_key = selection_score_key(args.selection_metric)
+    metric_label = selection_label(args.selection_metric)
+    grace_projection_seed = args.seed if args.grace_projection_seed < 0 else args.grace_projection_seed
     teacher_folder = Path(args.teacher_folder).resolve()
     if not teacher_folder.exists():
         raise FileNotFoundError(f"teacher folder does not exist: {teacher_folder}")
@@ -366,14 +473,17 @@ def run_controller(args: argparse.Namespace) -> None:
         output_root = Path(args.output_root).resolve()
     else:
         output_root = (
-            Path("dataset/rsr_teacher_selection")
+            Path(f"dataset/{args.selection_metric}_teacher_selection")
             / f"{sanitize_name(model_name)}__{sanitize_name(teacher_folder.name)}__n{args.sample_size}__seed{args.seed}"
         ).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
     dataset_info_path = Path(args.dataset_info_path).resolve()
-    dataset_export_dir = Path(args.dataset_export_dir).resolve()
+    dataset_export_dir = Path(args.dataset_export_dir or f"dataset/{args.selection_metric}_selected_teachers").resolve()
     dataset_export_dir.mkdir(parents=True, exist_ok=True)
+
+    if uses_gradient_baseline(args.selection_metric) and args.batch_size != 1:
+        raise ValueError(f"{metric_label} requires --batch-size 1 because gradients are computed per sample")
 
     teacher_files = sorted(teacher_folder.glob(args.teacher_glob))
     if not teacher_files:
@@ -411,6 +521,8 @@ def run_controller(args: argparse.Namespace) -> None:
     sample_size = min(args.sample_size, available_count)
     if sample_size <= 0:
         raise ValueError("--sample-size must be >= 1")
+    if uses_gradient_baseline(args.selection_metric) and sample_size < 2:
+        raise ValueError(f"{metric_label} requires at least 2 shared samples")
     if sample_size < args.sample_size:
         print(
             f"[controller] requested sample_size={args.sample_size}, but only {available_count} common ids are available; "
@@ -473,11 +585,18 @@ def run_controller(args: argparse.Namespace) -> None:
             "output_root": str(output_root),
             "result_path": str(result_path),
             "model_path": args.model_path,
+            "selection_metric": args.selection_metric,
             "dtype": args.dtype,
             "chat_template": args.chat_template,
             "batch_size": args.batch_size,
             "max_model_len": args.max_model_len,
             "rank_clip_r": args.rank_clip_r,
+            "grace_projection_dim": args.grace_projection_dim,
+            "grace_projection_seed": grace_projection_seed,
+            "grace_projection_chunk_size": args.grace_projection_chunk_size,
+            "grace_num_partitions": args.grace_num_partitions,
+            "grace_smoothing": args.grace_smoothing,
+            "seed": args.seed,
             "use_flash_attn": args.use_flash_attn,
             "jobs": worker_jobs,
         }
@@ -527,9 +646,12 @@ def run_controller(args: argparse.Namespace) -> None:
             raise ValueError(f"{result_path} must contain a JSON array")
         ranking_rows.extend(worker_rows)
 
-    ranking_rows.sort(key=lambda row: (row["rank_surprisal_ratio"], row["teacher_name"]))
     if not ranking_rows:
         raise RuntimeError("no teacher scores were produced")
+    if args.selection_metric in DESCENDING_SELECTION_METRICS:
+        ranking_rows.sort(key=lambda row: (-row["selection_score"], row["teacher_name"]))
+    else:
+        ranking_rows.sort(key=lambda row: (row["selection_score"], row["teacher_name"]))
 
     ranking_path = output_root / "teacher_ranking.json"
     ranking_tsv_path = output_root / "teacher_ranking.tsv"
@@ -541,7 +663,7 @@ def run_controller(args: argparse.Namespace) -> None:
     best_source_path = Path(best_row["source_path"])
 
     dataset_entry_name = args.dataset_entry_name or (
-        f"rsr_selected__{sanitize_name(model_name)}__n{sample_size}__{sanitize_name(best_teacher_name)}"
+        f"{args.selection_metric}_selected__{sanitize_name(model_name)}__n{sample_size}__{sanitize_name(best_teacher_name)}"
     )
     selected_dataset_copy_path = dataset_export_dir / f"{dataset_entry_name}.jsonl"
     shutil.copy2(best_source_path, selected_dataset_copy_path)
@@ -590,11 +712,19 @@ def run_controller(args: argparse.Namespace) -> None:
         "teacher_count": len(teacher_files),
         "model_path": args.model_path,
         "model_name": model_name,
+        "selection_metric": args.selection_metric,
+        "selection_score_key": score_key,
+        "selection_objective": selection_objective(args.selection_metric),
         "dtype": args.dtype,
         "chat_template": args.chat_template,
         "batch_size": args.batch_size,
         "max_model_len": args.max_model_len,
         "rank_clip_r": args.rank_clip_r,
+        "grace_projection_dim": args.grace_projection_dim,
+        "grace_projection_seed": grace_projection_seed,
+        "grace_projection_chunk_size": args.grace_projection_chunk_size,
+        "grace_num_partitions": args.grace_num_partitions,
+        "grace_smoothing": args.grace_smoothing,
         "sample_size_requested": args.sample_size,
         "sample_size_used": sample_size,
         "seed": args.seed,
@@ -615,7 +745,7 @@ def run_controller(args: argparse.Namespace) -> None:
     write_json(output_root / "run_summary.json", summary)
 
     print(f"[controller] ranking saved to {ranking_path}")
-    print(f"[controller] best teacher: {best_teacher_name} (RSR={best_row['rank_surprisal_ratio']:.6f})")
+    print(f"[controller] best teacher: {best_teacher_name} ({metric_label}={best_row[score_key]:.6f})")
     print(f"[controller] selected dataset copy: {selected_dataset_copy_path}")
     print(f"[controller] dataset_info updated: {dataset_info_path} -> {dataset_entry_name}")
 

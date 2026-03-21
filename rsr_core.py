@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
 import json
+import math
+import random
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -129,6 +132,64 @@ def _process_messages(
     return input_ids, response_positions
 
 
+def _load_json_or_jsonl(json_path: Path) -> List[Dict]:
+    if json_path.suffix.lower() == ".jsonl":
+        data = []
+        with json_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    data.append(json.loads(line))
+        return data
+    return json.loads(json_path.read_text(encoding="utf-8"))
+
+
+def _resolve_model_device(model) -> torch.device:
+    return next(model.parameters()).device
+
+
+def prepare_inference_items(
+    tokenizer,
+    json_path: Path,
+    max_model_len: int = None,
+    chat_template: str = "qwen",
+) -> Tuple[List[Dict], int]:
+    data = _load_json_or_jsonl(json_path)
+    text_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    pad_token_id = (
+        text_tokenizer.pad_token_id
+        if text_tokenizer.pad_token_id is not None
+        else text_tokenizer.eos_token_id
+    )
+    assistant_header, assistant_end = ASSISTANT_MARKERS[chat_template]
+    assistant_header_ids = text_tokenizer(assistant_header, add_special_tokens=False)["input_ids"]
+    assistant_end_ids = text_tokenizer(assistant_end, add_special_tokens=False)["input_ids"]
+
+    items = []
+    for index, sample in enumerate(data):
+        messages = sample.get("messages")
+        if not messages:
+            continue
+        input_ids, response_positions = _process_messages(
+            tokenizer=tokenizer,
+            messages=messages,
+            max_model_len=max_model_len,
+            assistant_header_ids=assistant_header_ids,
+            assistant_end_ids=assistant_end_ids,
+        )
+        if not input_ids or not response_positions:
+            continue
+        items.append(
+            {
+                "id": sample.get("id", index),
+                "input_ids": input_ids,
+                "response_positions": response_positions,
+            }
+        )
+
+    return items, pad_token_id
+
+
 def load_model_and_tokenizer(
     model_path: str,
     dtype: str = "float16",
@@ -181,51 +242,16 @@ def infer_dataset(
     rank_clip_r: int = 100,
     chat_template: str = "qwen",
 ) -> List[Dict]:
-    if json_path.suffix.lower() == ".jsonl":
-        data = []
-        with json_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    data.append(json.loads(line))
-    else:
-        data = json.loads(json_path.read_text(encoding="utf-8"))
-
-    text_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
-    pad_token_id = (
-        text_tokenizer.pad_token_id
-        if text_tokenizer.pad_token_id is not None
-        else text_tokenizer.eos_token_id
+    items, pad_token_id = prepare_inference_items(
+        tokenizer=tokenizer,
+        json_path=json_path,
+        max_model_len=max_model_len,
+        chat_template=chat_template,
     )
-    assistant_header, assistant_end = ASSISTANT_MARKERS[chat_template]
-    assistant_header_ids = text_tokenizer(assistant_header, add_special_tokens=False)["input_ids"]
-    assistant_end_ids = text_tokenizer(assistant_end, add_special_tokens=False)["input_ids"]
-
-    items = []
-    for index, sample in enumerate(data):
-        messages = sample.get("messages")
-        if not messages:
-            continue
-        input_ids, response_positions = _process_messages(
-            tokenizer=tokenizer,
-            messages=messages,
-            max_model_len=max_model_len,
-            assistant_header_ids=assistant_header_ids,
-            assistant_end_ids=assistant_end_ids,
-        )
-        if not input_ids or not response_positions:
-            continue
-        items.append(
-            {
-                "id": sample.get("id", index),
-                "input_ids": input_ids,
-                "response_positions": response_positions,
-            }
-        )
-
     if not items:
         return []
 
+    model_device = _resolve_model_device(model)
     inferred_samples: List[Dict] = []
     for start in tqdm(range(0, len(items), batch_size), desc="Inference", file=sys.stdout):
         batch = items[start : start + batch_size]
@@ -239,8 +265,8 @@ def infer_dataset(
             input_ids_batch.append(ids + [pad_token_id] * pad_len)
             attention_mask_batch.append([1] * len(ids) + [0] * pad_len)
 
-        input_ids_tensor = torch.tensor(input_ids_batch, dtype=torch.long, device=model.device)
-        attention_mask_tensor = torch.tensor(attention_mask_batch, dtype=torch.long, device=model.device)
+        input_ids_tensor = torch.tensor(input_ids_batch, dtype=torch.long, device=model_device)
+        attention_mask_tensor = torch.tensor(attention_mask_batch, dtype=torch.long, device=model_device)
         outputs = model(
             input_ids=input_ids_tensor,
             attention_mask=attention_mask_tensor,
@@ -283,6 +309,229 @@ def infer_dataset(
             )
 
     return inferred_samples
+
+
+class FixedSparseRandomProjector:
+    def __init__(self, output_dim: int, seed: int = 42, chunk_size: int = 1_048_576):
+        if output_dim <= 0:
+            raise ValueError("output_dim must be >= 1")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be >= 1")
+
+        # A dense d x D Rademacher matrix is infeasible for modern LMs, so we
+        # stream a fixed CountSketch-style sparse projection with the same role.
+        self.output_dim = output_dim
+        self.chunk_size = chunk_size
+        self._prime = 2_147_483_647
+        rng = random.Random(seed)
+        self._bucket_a = rng.randrange(1, self._prime)
+        self._bucket_b = rng.randrange(0, self._prime)
+        self._sign_a = rng.randrange(1, self._prime)
+        self._sign_b = rng.randrange(0, self._prime)
+
+    def project_model_gradients(self, model) -> torch.Tensor:
+        device = _resolve_model_device(model)
+        projected = torch.zeros(self.output_dim, device=device, dtype=torch.float32)
+        global_offset = 0
+
+        for parameter in model.parameters():
+            param_numel = parameter.numel()
+            if parameter.grad is None:
+                global_offset += param_numel
+                continue
+
+            grad_flat = parameter.grad.detach().reshape(-1).float()
+            for chunk_start in range(0, param_numel, self.chunk_size):
+                chunk_end = min(chunk_start + self.chunk_size, param_numel)
+                grad_chunk = grad_flat[chunk_start:chunk_end]
+                indices = torch.arange(
+                    global_offset + chunk_start + 1,
+                    global_offset + chunk_end + 1,
+                    device=grad_chunk.device,
+                    dtype=torch.long,
+                )
+                bucket_ids = ((indices * self._bucket_a + self._bucket_b) % self._prime) % self.output_dim
+                signs = (((indices * self._sign_a + self._sign_b) % self._prime) % 2).mul_(2).sub_(1)
+                projected.scatter_add_(0, bucket_ids, grad_chunk * signs.to(dtype=torch.float32))
+            global_offset += param_numel
+
+        return projected
+
+
+def _build_grace_partitions(sample_count: int, num_partitions: int, seed: int) -> List[List[int]]:
+    if sample_count < 2:
+        raise ValueError("GRACE requires at least 2 samples")
+
+    partition_count = max(2, min(num_partitions, sample_count))
+    indices = list(range(sample_count))
+    random.Random(seed).shuffle(indices)
+    partitions = [indices[partition_index::partition_count] for partition_index in range(partition_count)]
+    return [partition for partition in partitions if partition]
+
+
+def _normalized_second_moment(gradients: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    normalized = gradients / gradients.norm(dim=1, keepdim=True).clamp_min(eps)
+    return normalized.T @ normalized / gradients.shape[0]
+
+
+def _entropy_of_eigenvalues(matrix: torch.Tensor, eps: float = 1e-12) -> float:
+    eigenvalues = torch.linalg.eigvalsh(matrix.float()).clamp_min(0.0)
+    total = eigenvalues.sum()
+    if total <= eps:
+        return 0.0
+    eigenvalues = eigenvalues / total
+    eigenvalues = eigenvalues.clamp_min(eps)
+    return float((-eigenvalues * eigenvalues.log()).sum().item())
+
+
+def compute_gradient_baseline_metrics(
+    processed_gradients: torch.Tensor,
+    response_lengths: Sequence[int],
+    num_partitions: int = 10,
+    smoothing: float = 1e-4,
+    partition_seed: int = 42,
+) -> Dict[str, float]:
+    if processed_gradients.ndim != 2:
+        raise ValueError("processed_gradients must be a 2D tensor")
+    if processed_gradients.shape[0] == 0:
+        return {}
+
+    sample_count, projection_dim = processed_gradients.shape
+    if sample_count != len(response_lengths):
+        raise ValueError("response_lengths must match processed_gradients rows")
+    if sample_count < 2:
+        raise ValueError("GRACE requires at least 2 processed gradients")
+    if smoothing < 0:
+        raise ValueError("smoothing must be >= 0")
+
+    gradients = processed_gradients.float()
+    sigma = gradients.T @ gradients / sample_count
+    sigma_tilde = _normalized_second_moment(gradients)
+
+    identity = torch.eye(projection_dim, dtype=torch.float32)
+    partitions = _build_grace_partitions(
+        sample_count=sample_count,
+        num_partitions=num_partitions,
+        seed=partition_seed,
+    )
+
+    grace_terms = []
+    grace_variance_terms = []
+    grace_bias_terms = []
+    all_indices = set(range(sample_count))
+    for held_out_indices in partitions:
+        background_indices = sorted(all_indices - set(held_out_indices))
+        if not background_indices:
+            continue
+
+        held_out = gradients[held_out_indices]
+        held_out_centered = held_out - held_out.mean(dim=0, keepdim=True)
+        sigma_test = held_out.T @ held_out / held_out.shape[0]
+        sigma_test_variance = held_out_centered.T @ held_out_centered / held_out.shape[0]
+
+        background = gradients[background_indices]
+        hat_sigma = _normalized_second_moment(background) + (smoothing / projection_dim) * identity
+
+        solved_sigma = torch.linalg.solve(hat_sigma, sigma_test)
+        solved_variance = torch.linalg.solve(hat_sigma, sigma_test_variance)
+        held_out_mean = held_out.mean(dim=0)
+        solved_mean = torch.linalg.solve(hat_sigma, held_out_mean.unsqueeze(1)).squeeze(1)
+
+        grace_terms.append(float(torch.trace(solved_sigma).item()))
+        grace_variance_terms.append(float(torch.trace(solved_variance).item()))
+        grace_bias_terms.append(float(torch.dot(held_out_mean, solved_mean).item()))
+
+    if not grace_terms:
+        raise ValueError("GRACE partitions could not be constructed")
+
+    row_norms = gradients.norm(dim=1)
+    return {
+        "avg_resp_token_length": sum(response_lengths) / sample_count,
+        "avg_processed_grad_norm": float(row_norms.mean().item()),
+        "g_norm": float(torch.trace(sigma).item()),
+        "g_vendi": _entropy_of_eigenvalues(sigma_tilde),
+        "grace": sum(grace_terms) / len(grace_terms),
+        "grace_variance": sum(grace_variance_terms) / len(grace_variance_terms),
+        "grace_bias": sum(grace_bias_terms) / len(grace_bias_terms),
+        "grace_num_partitions": len(partitions),
+        "grace_smoothing": float(smoothing),
+        "grace_projection_dim": projection_dim,
+    }
+
+
+def extract_processed_gradients(
+    model,
+    tokenizer,
+    json_path: Path,
+    max_model_len: int = None,
+    chat_template: str = "qwen",
+    projection_dim: int = 512,
+    projection_seed: int = 42,
+    projection_chunk_size: int = 1_048_576,
+) -> Tuple[torch.Tensor, List[Dict]]:
+    items, _ = prepare_inference_items(
+        tokenizer=tokenizer,
+        json_path=json_path,
+        max_model_len=max_model_len,
+        chat_template=chat_template,
+    )
+    if not items:
+        return torch.empty(0, projection_dim, dtype=torch.float32), []
+
+    projector = FixedSparseRandomProjector(
+        output_dim=projection_dim,
+        seed=projection_seed,
+        chunk_size=projection_chunk_size,
+    )
+    model_device = _resolve_model_device(model)
+    processed_gradients = []
+    sample_details = []
+
+    for item in tqdm(items, desc="Gradients", file=sys.stdout):
+        seq_len = len(item["input_ids"])
+        response_positions = sorted(set(pos for pos in item["response_positions"] if 0 < pos < seq_len))
+        logit_positions = [pos - 1 for pos in response_positions]
+        if not logit_positions:
+            continue
+
+        input_ids_tensor = torch.tensor([item["input_ids"]], dtype=torch.long, device=model_device)
+        attention_mask_tensor = torch.ones_like(input_ids_tensor)
+        targets = torch.tensor(
+            [item["input_ids"][pos] for pos in response_positions],
+            dtype=torch.long,
+            device=model_device,
+        )
+
+        model.zero_grad(set_to_none=True)
+        outputs = model(
+            input_ids=input_ids_tensor,
+            attention_mask=attention_mask_tensor,
+            use_cache=False,
+        )
+        valid_logits = outputs.logits[0, logit_positions].float()
+        sample_loss = F.cross_entropy(valid_logits, targets, reduction="mean")
+        sample_loss.backward()
+
+        projected_gradient = projector.project_model_gradients(model)
+        response_length = len(response_positions)
+        length_scale = math.log(max(response_length, 2))
+        processed_gradient = projected_gradient * length_scale
+
+        processed_gradients.append(processed_gradient.detach().cpu())
+        sample_details.append(
+            {
+                "sample_id": item["id"],
+                "resp_token_length": response_length,
+                "avg_surprisal": float(sample_loss.detach().item()),
+                "projected_grad_norm": float(projected_gradient.norm().detach().cpu().item()),
+                "processed_grad_norm": float(processed_gradient.norm().detach().cpu().item()),
+            }
+        )
+        model.zero_grad(set_to_none=True)
+
+    if not processed_gradients:
+        return torch.empty(0, projection_dim, dtype=torch.float32), []
+    return torch.stack(processed_gradients, dim=0), sample_details
 
 
 def compute_sample_metrics(inferred_samples: List[Dict], rank_clip_r: int = 100) -> Tuple[Dict[str, float], List[Dict]]:

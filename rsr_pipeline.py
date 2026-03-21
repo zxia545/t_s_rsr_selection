@@ -122,6 +122,12 @@ def resolve_path(value: Optional[str], base: Path) -> str:
 def build_command(dataset_cfg: Dict, model_cfg: Dict, run_cfg: Dict, global_output_root: Path) -> Tuple[List[str], str]:
     dataset_name = dataset_cfg["name"]
     model_name = model_cfg["name"]
+    selection_metric = (
+        run_cfg.get("selection_metric")
+        or dataset_cfg.get("selection_metric")
+        or model_cfg.get("selection_metric")
+        or "rsr"
+    )
 
     run_name = run_cfg.get("name") or f"{sanitize_name(model_name)}__{sanitize_name(dataset_name)}"
     output_root = run_cfg.get("output_root") or dataset_cfg.get("output_root")
@@ -134,7 +140,7 @@ def build_command(dataset_cfg: Dict, model_cfg: Dict, run_cfg: Dict, global_outp
 
     dataset_entry_name = run_cfg.get("dataset_entry_name")
     if not dataset_entry_name:
-        dataset_entry_prefix = dataset_cfg.get("dataset_entry_prefix", "rsr_selected")
+        dataset_entry_prefix = dataset_cfg.get("dataset_entry_prefix", f"{selection_metric}_selected")
         dataset_entry_name = (
             f"{dataset_entry_prefix}__{sanitize_name(model_name)}__n{run_cfg.get('sample_size', dataset_cfg.get('sample_size', 200))}"
             f"__{sanitize_name(dataset_name)}"
@@ -163,12 +169,18 @@ def build_command(dataset_cfg: Dict, model_cfg: Dict, run_cfg: Dict, global_outp
         ("system_field", "--system-field"),
         ("prompt_field", "--prompt-field"),
         ("response_field", "--response-field"),
+        ("selection_metric", "--selection-metric"),
         ("sample_size", "--sample-size"),
         ("seed", "--seed"),
         ("batch_size", "--batch-size"),
         ("dtype", "--dtype"),
         ("chat_template", "--chat-template"),
         ("rank_clip_r", "--rank-clip-r"),
+        ("grace_projection_dim", "--grace-projection-dim"),
+        ("grace_projection_seed", "--grace-projection-seed"),
+        ("grace_projection_chunk_size", "--grace-projection-chunk-size"),
+        ("grace_num_partitions", "--grace-num-partitions"),
+        ("grace_smoothing", "--grace-smoothing"),
         ("max_model_len", "--max-model-len"),
         ("gpus_per_worker", "--gpus-per-worker"),
         ("max_workers", "--max-workers"),

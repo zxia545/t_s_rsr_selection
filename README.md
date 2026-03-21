@@ -1,14 +1,14 @@
-# Teacher RSR Selection Pipeline
+# Teacher Selection Pipeline
 
-This directory contains a standalone pipeline for selecting the best teacher-output dataset with Rank Surprisal Ratio (RSR).
+This directory contains a standalone pipeline for selecting the best teacher-output dataset with either Rank Surprisal Ratio (RSR) or gradient baselines such as GRACE.
 
 It is designed for the workflow you described:
 
 1. Each teacher has one `.jsonl` or `.json` file.
 2. Each record contains fields such as `system`, `instruction`, and `teacher_output`.
 3. The pipeline samples a shared subset of examples across all teachers.
-4. A student model scores every teacher's sampled responses with RSR.
-5. Teachers are ranked by ascending `rank_surprisal_ratio`.
+4. A student model scores every teacher's sampled responses with the configured selection metric.
+5. Teachers are ranked according to that metric.
 6. The best teacher file is copied out as a final dataset and a matching `dataset_info.json` is produced.
 
 ## Files
@@ -19,18 +19,34 @@ It is designed for the workflow you described:
   - Handles shared-id sampling, multi-worker GPU scheduling, scoring, ranking, and final dataset export.
 
 - `rsr_core.py`
-  - Core RSR implementation.
-  - Loads the student model/tokenizer, builds chat inputs, computes token-level NLL/rank, and aggregates sample/dataset RSR.
+  - Core scoring implementation.
+  - Loads the student model/tokenizer, builds chat inputs, computes RSR, and extracts projected student gradients for GRACE / G-Norm / G-Vendi.
 
 - `rsr_pipeline.py`
   - Batch runner for multiple datasets and multiple student models.
   - Uses a JSON config and dispatches repeated runs of `teacher_rsr_selection.py`.
 
+- `GRACE_BASELINE.md`
+  - Detailed note for the GRACE / G-Norm / G-Vendi teacher-selection path.
+  - Covers inputs, outputs, formulas, paper alignment, and output artifacts.
+
 - `run_rsr_pipeline.sh`
   - Thin shell wrapper around `rsr_pipeline.py`.
 
+- `configs/rsr_pipeline.example_grace.json`
+  - Explicit GRACE batch config.
+
+- `configs/rsr_pipeline.example_rsr.json`
+  - Explicit RSR batch config.
+
+- `configs/rsr_pipeline_example_test_grace.json`
+  - Tiny GRACE dry-run config.
+
+- `configs/rsr_pipeline_example_test_rsr.json`
+  - Tiny RSR dry-run config.
+
 - `configs/rsr_pipeline.example.json`
-  - Example batch config.
+  - Backward-compatible alias of the GRACE example config.
 
 - `requirements.txt`
   - Minimal Python dependencies for this root-level pipeline.
@@ -85,13 +101,14 @@ That pin is intentional because this machine was validated with `torch>=2.0.0`.
 
 ## Single Run
 
-Run one dataset folder against one student model:
+Run one dataset folder against one student model with GRACE:
 
 ```bash
 python teacher_rsr_selection.py \
   --teacher-folder dataset/gsm8k_teacher_output \
   --model-path Qwen/Qwen2.5-0.5B-Instruct \
   --model-name qwen2.5-0.5b-instruct \
+  --selection-metric grace \
   --teacher-glob "*.jsonl" \
   --id-field id \
   --system-field system \
@@ -107,6 +124,29 @@ python teacher_rsr_selection.py \
   --output-root outputs/gsm8k_qwen05b \
   --copy-selected-to-output
 ```
+
+For the original RSR selector, use `--selection-metric rsr`.
+
+### Supported Metrics
+
+- `rsr`
+  - Rank Surprisal Ratio on sampled responses.
+
+- `grace`
+  - Dataset-level GRACE score from the RSR paper setup: sample 200 trajectories, compute one projected student gradient per sample, split into folds, and average `Tr(Σ_hat_bg^{-1} Σ_test)`.
+
+- `g_norm`
+  - Gradient-norm baseline computed from the same processed gradients.
+
+- `g_vendi`
+  - Gradient diversity baseline computed from the normalized gradient spectrum.
+
+### GRACE Notes
+
+- Use `--batch-size 1`.
+- Recommended paper-style settings are `--sample-size 200`, `--grace-projection-dim 512`, `--grace-num-partitions 10`.
+- The implementation keeps the paper structure but uses a fixed sparse CountSketch-style random projection instead of a dense `d x D` Rademacher matrix so large-model gradients remain tractable.
+- GRACE is dataset-level only. The pipeline writes per-sample diagnostics, but teacher ranking uses the dataset score.
 
 ### Important Arguments
 
@@ -128,8 +168,20 @@ python teacher_rsr_selection.py \
 - `--response-field`
   - Field used as the assistant response to be scored.
 
+- `--selection-metric`
+  - One of `rsr`, `grace`, `g_norm`, or `g_vendi`.
+
 - `--sample-size`
   - Number of shared ids to sample across teachers.
+
+- `--grace-projection-dim`
+  - Output dimension for projected gradients when using gradient baselines.
+
+- `--grace-num-partitions`
+  - Number of cross-validation partitions for GRACE.
+
+- `--grace-smoothing`
+  - Smoothing coefficient `nu` used in the regularized inverse covariance.
 
 - `--gpus-per-worker`
   - Number of visible GPUs assigned to each scoring worker.
@@ -153,7 +205,7 @@ A single run creates a folder like:
 ```text
 outputs/gsm8k_qwen05b/
   final_dataset/
-    rsr_selected__...jsonl
+    <metric>_selected__...jsonl
     dataset_info.json
   logs/
   manifests/
@@ -170,7 +222,7 @@ outputs/gsm8k_qwen05b/
 ### Key Outputs
 
 - `teacher_ranking.json`
-  - Full ranking from smallest to largest `rank_surprisal_ratio`.
+  - Full ranking sorted by the configured selection metric.
 
 - `teacher_ranking.tsv`
   - Same ranking in tabular form.
@@ -196,14 +248,22 @@ Use `rsr_pipeline.py` when you want to score many datasets and many student mode
 
 ```bash
 python rsr_pipeline.py \
-  --config configs/rsr_pipeline.example.json \
+  --config configs/rsr_pipeline.example_grace.json \
   --output-root outputs/pipeline_runs
 ```
 
 or
 
 ```bash
-bash run_rsr_pipeline.sh configs/rsr_pipeline.example.json --output-root outputs/pipeline_runs
+bash run_rsr_pipeline.sh configs/rsr_pipeline.example_grace.json --output-root outputs/pipeline_runs
+```
+
+For the RSR selector, switch to:
+
+```bash
+python rsr_pipeline.py \
+  --config configs/rsr_pipeline.example_rsr.json \
+  --output-root outputs/pipeline_runs
 ```
 
 ## Config Format
@@ -232,6 +292,28 @@ Config values are merged in this order:
 
 That means dataset-specific field mappings are supported directly in each dataset block.
 
+### Recommended Setup
+
+Keep separate config files for `grace` and `rsr`.
+
+That keeps:
+
+- `selection_metric`
+- metric-specific parameters
+- export directories
+- dataset entry prefixes
+
+from getting mixed together.
+
+In this repo:
+
+- `configs/rsr_pipeline.example_grace.json`
+- `configs/rsr_pipeline.example_rsr.json`
+- `configs/rsr_pipeline_example_test_grace.json`
+- `configs/rsr_pipeline_example_test_rsr.json`
+
+The older files `configs/rsr_pipeline.example.json` and `configs/rsr_pipeline_example_test.json` are kept as GRACE aliases for backward compatibility.
+
 ### Example Config
 
 ```json
@@ -241,12 +323,16 @@ That means dataset-specific field mappings are supported directly in each datase
     "system_field": "system",
     "prompt_field": "instruction",
     "response_field": "teacher_output",
+    "selection_metric": "grace",
     "sample_size": 200,
     "seed": 42,
     "batch_size": 1,
     "dtype": "float16",
     "chat_template": "qwen",
     "rank_clip_r": 100,
+    "grace_projection_dim": 512,
+    "grace_num_partitions": 10,
+    "grace_smoothing": 0.0001,
     "max_model_len": 2048,
     "gpus_per_worker": 1,
     "max_workers": 0,
@@ -264,8 +350,8 @@ That means dataset-specific field mappings are supported directly in each datase
       "teacher_folder": "dataset/gsm8k_teacher_output",
       "teacher_glob": "*.jsonl",
       "dataset_info_path": "dataset/dataset_info.json",
-      "dataset_export_dir": "dataset/rsr_selected_teachers",
-      "dataset_entry_prefix": "rsr_selected"
+      "dataset_export_dir": "dataset/grace_selected_teachers",
+      "dataset_entry_prefix": "grace_selected"
     },
     {
       "name": "other_dataset",
@@ -319,12 +405,13 @@ For each run:
 3. Intersect valid ids across all teachers.
 4. Sample `sample_size` shared ids with the configured seed.
 5. Convert records into chat-format messages.
-6. Score each teacher with the student model using RSR.
-7. Rank teachers by ascending `rank_surprisal_ratio`.
+6. Score each teacher with the student model using the configured selection metric.
+7. Rank teachers according to that metric's objective.
 8. Copy the best teacher file into output locations.
 9. Write ranking artifacts and dataset info files.
 
-Smaller `rank_surprisal_ratio` is considered better.
+- For `rsr`, smaller `rank_surprisal_ratio` is better.
+- For `grace`, smaller `grace` is better.
 
 ## Dry Run and Filtering
 
@@ -332,7 +419,7 @@ Smaller `rank_surprisal_ratio` is considered better.
 
 ```bash
 python rsr_pipeline.py \
-  --config configs/rsr_pipeline.example.json \
+  --config configs/rsr_pipeline.example_grace.json \
   --output-root outputs/pipeline_runs \
   --only-models qwen2.5-0.5b-instruct \
   --only-datasets gsm8k_teacher_output \
