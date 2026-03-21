@@ -34,3 +34,5 @@ htmlcov/
 
 dataset/gsm8k_teacher_output/*
 pipeline_runs/*
+
+*pdf
