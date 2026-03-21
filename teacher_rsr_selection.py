@@ -111,6 +111,42 @@ def collect_valid_ids(path: Path, id_field: str, prompt_field: str, response_fie
     return valid_ids, scanned
 
 
+def collect_teacher_overview_and_common_ids(
+    teacher_files: Sequence[Path],
+    id_field: str,
+    prompt_field: str,
+    response_field: str,
+) -> Tuple[List[Dict[str, object]], set]:
+    common_ids: Optional[set] = None
+    teacher_overview: List[Dict[str, object]] = []
+
+    for path in teacher_files:
+        teacher_name = derive_teacher_name(path)
+        valid_ids, scanned_count = collect_valid_ids(
+            path=path,
+            id_field=id_field,
+            prompt_field=prompt_field,
+            response_field=response_field,
+        )
+        if common_ids is None:
+            common_ids = set(valid_ids)
+        else:
+            common_ids &= valid_ids
+        teacher_overview.append(
+            {
+                "teacher_name": teacher_name,
+                "source_path": str(path),
+                "scanned_count": scanned_count,
+                "valid_count": len(valid_ids),
+            }
+        )
+
+    common_valid_ids = common_ids or set()
+    for row in teacher_overview:
+        row["common_valid_id_count"] = len(common_valid_ids)
+    return teacher_overview, common_valid_ids
+
+
 def build_messages(system_text: str, prompt_text: str, response_text: str) -> List[Dict[str, str]]:
     messages: List[Dict[str, str]] = []
     if system_text.strip():
@@ -490,30 +526,12 @@ def run_controller(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"no teacher files matched {args.teacher_glob!r} under {teacher_folder}")
 
     print(f"[controller] discovered {len(teacher_files)} teacher files")
-    common_ids = None
-    teacher_overview = []
-    for path in teacher_files:
-        teacher_name = derive_teacher_name(path)
-        valid_ids, scanned_count = collect_valid_ids(
-            path=path,
-            id_field=args.id_field,
-            prompt_field=args.prompt_field,
-            response_field=args.response_field,
-        )
-        if common_ids is None:
-            common_ids = set(valid_ids)
-        else:
-            common_ids &= valid_ids
-        teacher_overview.append(
-            {
-                "teacher_name": teacher_name,
-                "source_path": str(path),
-                "scanned_count": scanned_count,
-                "valid_count": len(valid_ids),
-            }
-        )
-
-    common_ids = common_ids or set()
+    teacher_overview, common_ids = collect_teacher_overview_and_common_ids(
+        teacher_files=teacher_files,
+        id_field=args.id_field,
+        prompt_field=args.prompt_field,
+        response_field=args.response_field,
+    )
     if not common_ids:
         raise RuntimeError("no common valid sample ids were found across teachers")
 
@@ -710,6 +728,7 @@ def run_controller(args: argparse.Namespace) -> None:
         "teacher_folder": str(teacher_folder),
         "teacher_glob": args.teacher_glob,
         "teacher_count": len(teacher_files),
+        "common_valid_id_count": available_count,
         "model_path": args.model_path,
         "model_name": model_name,
         "selection_metric": args.selection_metric,
