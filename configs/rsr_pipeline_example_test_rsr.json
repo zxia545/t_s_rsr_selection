@@ -27,8 +27,6 @@
       "name": "gsm8k_teacher_output",
       "teacher_folder": "dataset/gsm8k_teacher_output",
       "teacher_glob": "*.jsonl",
-      "dataset_info_path": "dataset/dataset_info.json",
-      "dataset_export_dir": "dataset/rsr_selected_teachers",
       "dataset_entry_prefix": "rsr_selected",
       "id_field": "id",
       "system_field": "system",

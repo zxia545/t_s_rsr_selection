@@ -438,7 +438,11 @@ def build_controller_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", required=True, help="HF model name or local path for the student model.")
     parser.add_argument("--model-name", default="", help="Optional display name for the student model.")
     parser.add_argument("--output-root", default="", help="Folder for ranking outputs, prepared messages, logs, and manifests.")
-    parser.add_argument("--dataset-info-path", default="dataset/dataset_info.json")
+    parser.add_argument(
+        "--dataset-info-path",
+        default="",
+        help="Optional global dataset_info.json to update. Leave empty if you only need output_root/final_dataset.",
+    )
     parser.add_argument(
         "--dataset-export-dir",
         default="",
@@ -514,9 +518,10 @@ def run_controller(args: argparse.Namespace) -> None:
         ).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
-    dataset_info_path = Path(args.dataset_info_path).resolve()
-    dataset_export_dir = Path(args.dataset_export_dir or f"dataset/{args.selection_metric}_selected_teachers").resolve()
-    dataset_export_dir.mkdir(parents=True, exist_ok=True)
+    dataset_info_path = Path(args.dataset_info_path).resolve() if args.dataset_info_path else None
+    dataset_export_dir = Path(args.dataset_export_dir).resolve() if args.dataset_export_dir else None
+    if dataset_export_dir is not None:
+        dataset_export_dir.mkdir(parents=True, exist_ok=True)
 
     if uses_gradient_baseline(args.selection_metric) and args.batch_size != 1:
         raise ValueError(f"{metric_label} requires --batch-size 1 because gradients are computed per sample")
@@ -683,8 +688,6 @@ def run_controller(args: argparse.Namespace) -> None:
     dataset_entry_name = args.dataset_entry_name or (
         f"{args.selection_metric}_selected__{sanitize_name(model_name)}__n{sample_size}__{sanitize_name(best_teacher_name)}"
     )
-    selected_dataset_copy_path = dataset_export_dir / f"{dataset_entry_name}.jsonl"
-    shutil.copy2(best_source_path, selected_dataset_copy_path)
 
     output_final_dir = output_root / "final_dataset"
     output_final_dir.mkdir(parents=True, exist_ok=True)
@@ -692,19 +695,28 @@ def run_controller(args: argparse.Namespace) -> None:
     shutil.copy2(best_source_path, output_selected_copy_path)
     output_dataset_info_path = output_final_dir / "dataset_info.json"
 
-    dataset_root = dataset_info_path.parent
-    try:
-        relative_dataset_file = selected_dataset_copy_path.relative_to(dataset_root).as_posix()
-    except ValueError:
-        relative_dataset_file = os.path.relpath(selected_dataset_copy_path, dataset_root).replace(os.sep, "/")
-    global_dataset_info = update_dataset_info(
-        dataset_info_path=dataset_info_path,
-        dataset_entry_name=dataset_entry_name,
-        file_name_relative_to_dataset_root=relative_dataset_file,
-        system_field=args.system_field,
-        prompt_field=args.prompt_field,
-        response_field=args.response_field,
-    )
+    selected_dataset_copy_path = None
+    global_dataset_info = {}
+    if dataset_export_dir is not None:
+        selected_dataset_copy_path = dataset_export_dir / f"{dataset_entry_name}.jsonl"
+        shutil.copy2(best_source_path, selected_dataset_copy_path)
+
+    if dataset_info_path is not None:
+        if selected_dataset_copy_path is None:
+            raise ValueError("--dataset-info-path requires --dataset-export-dir so the exported dataset file can be indexed")
+        dataset_root = dataset_info_path.parent
+        try:
+            relative_dataset_file = selected_dataset_copy_path.relative_to(dataset_root).as_posix()
+        except ValueError:
+            relative_dataset_file = os.path.relpath(selected_dataset_copy_path, dataset_root).replace(os.sep, "/")
+        global_dataset_info = update_dataset_info(
+            dataset_info_path=dataset_info_path,
+            dataset_entry_name=dataset_entry_name,
+            file_name_relative_to_dataset_root=relative_dataset_file,
+            system_field=args.system_field,
+            prompt_field=args.prompt_field,
+            response_field=args.response_field,
+        )
 
     output_dataset_info = {
         dataset_entry_name: {
@@ -750,9 +762,9 @@ def run_controller(args: argparse.Namespace) -> None:
         "sampled_ids_path": str(output_root / "sampled_ids.json"),
         "ranking_path": str(ranking_path),
         "ranking_tsv_path": str(ranking_tsv_path),
-        "dataset_info_path": str(dataset_info_path),
+        "dataset_info_path": str(dataset_info_path) if dataset_info_path is not None else "",
         "dataset_entry_name": dataset_entry_name,
-        "selected_dataset_copy_path": str(selected_dataset_copy_path),
+        "selected_dataset_copy_path": str(selected_dataset_copy_path) if selected_dataset_copy_path is not None else "",
         "selected_output_copy_path": str(output_selected_copy_path),
         "output_dataset_info_path": str(output_dataset_info_path),
         "best_teacher": best_row,
@@ -765,8 +777,11 @@ def run_controller(args: argparse.Namespace) -> None:
 
     print(f"[controller] ranking saved to {ranking_path}")
     print(f"[controller] best teacher: {best_teacher_name} ({metric_label}={best_row[score_key]:.6f})")
-    print(f"[controller] selected dataset copy: {selected_dataset_copy_path}")
-    print(f"[controller] dataset_info updated: {dataset_info_path} -> {dataset_entry_name}")
+    print(f"[controller] selected dataset copy: {output_selected_copy_path}")
+    if selected_dataset_copy_path is not None:
+        print(f"[controller] exported dataset copy: {selected_dataset_copy_path}")
+    if dataset_info_path is not None:
+        print(f"[controller] dataset_info updated: {dataset_info_path} -> {dataset_entry_name}")
 
 
 def main() -> None:
