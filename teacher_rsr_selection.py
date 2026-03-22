@@ -174,6 +174,22 @@ def jsonl_has_expected_row_count(path: Path, expected_count: int) -> bool:
     return row_count == expected_count
 
 
+def load_jsonl_rows(path: Path) -> List[Dict]:
+    rows: List[Dict] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}: invalid JSON on line {line_no}: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise ValueError(f"{path}: line {line_no} is not a JSON object")
+            rows.append(payload)
+    return rows
+
+
 def prepare_teacher_job(
     source_path: Path,
     prepared_path: Path,
@@ -399,6 +415,22 @@ def has_complete_sample_metrics(sample_metrics_path: Path, expected_count: int) 
     return jsonl_has_expected_row_count(sample_metrics_path, expected_count)
 
 
+def compute_rsr_dataset_metrics_from_sample_metrics(sample_metrics: Sequence[Dict]) -> Dict[str, float]:
+    if not sample_metrics:
+        return {}
+    eps = 1e-12
+    count = len(sample_metrics)
+    sum_avg_rank = sum(float(item["avg_rank_clip"]) for item in sample_metrics)
+    sum_avg_surprisal = sum(float(item["avg_surprisal"]) for item in sample_metrics)
+    sum_resp_token_length = sum(int(item["resp_token_length"]) for item in sample_metrics)
+    return {
+        "avg_resp_token_length": sum_resp_token_length / count,
+        "avg_rank_clip": sum_avg_rank / count,
+        "avg_surprisal": sum_avg_surprisal / count,
+        "rank_surprisal_ratio": sum_avg_rank / max(sum_avg_surprisal, eps),
+    }
+
+
 def run_worker(manifest_path: Path) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     jobs = manifest["jobs"]
@@ -419,6 +451,8 @@ def run_worker(manifest_path: Path) -> None:
     result_path = Path(manifest["result_path"])
     existing_result_rows = load_worker_result_rows(result_path) or []
     existing_result_by_teacher = {row["teacher_name"]: row for row in existing_result_rows}
+    processed_gradients_dir = output_root / "processed_gradients"
+    processed_gradients_dir.mkdir(parents=True, exist_ok=True)
 
     completed_teacher_names = set()
     for job in jobs:
@@ -449,11 +483,58 @@ def run_worker(manifest_path: Path) -> None:
         teacher_name = job["teacher_name"]
         prepared_path = Path(job["prepared_path"])
         sample_metrics_path = output_root / "sample_metrics" / f"{sanitize_name(teacher_name)}.jsonl"
+        processed_gradients_path = processed_gradients_dir / f"{sanitize_name(teacher_name)}.pt"
         if teacher_name in completed_teacher_names:
             print(f"[worker {worker_index}] resuming: skipping completed teacher {teacher_name}")
             results.append(existing_result_by_teacher[teacher_name])
             write_json(result_path, results)
             continue
+
+        if has_complete_sample_metrics(sample_metrics_path, int(job["sample_count"])):
+            sample_metrics = load_jsonl_rows(sample_metrics_path)
+            if uses_gradient_baseline(selection_metric):
+                if processed_gradients_path.exists():
+                    print(f"[worker {worker_index}] resuming from cached gradients for {teacher_name}")
+                    processed_gradients = torch.load(processed_gradients_path, map_location="cpu")
+                    dataset_metrics = compute_gradient_baseline_metrics(
+                        processed_gradients=processed_gradients,
+                        response_lengths=[int(row["resp_token_length"]) for row in sample_metrics],
+                        num_partitions=manifest["grace_num_partitions"],
+                        smoothing=manifest["grace_smoothing"],
+                        partition_seed=manifest["seed"],
+                    )
+                    infer_seconds = 0.0
+                else:
+                    print(
+                        f"[worker {worker_index}] sample_metrics exists for {teacher_name} but cached gradients are missing; "
+                        "recomputing"
+                    )
+                    sample_metrics = []
+                    dataset_metrics = {}
+                    infer_seconds = 0.0
+            else:
+                print(f"[worker {worker_index}] resuming from sample_metrics for {teacher_name}")
+                dataset_metrics = compute_rsr_dataset_metrics_from_sample_metrics(sample_metrics)
+                infer_seconds = 0.0
+
+            if sample_metrics and dataset_metrics:
+                result_row = {
+                    "teacher_name": teacher_name,
+                    "source_path": job["source_path"],
+                    "prepared_path": job["prepared_path"],
+                    "sample_metrics_path": str(sample_metrics_path),
+                    "sample_count": job["sample_count"],
+                    "infer_seconds": round(infer_seconds, 6),
+                    "worker_index": worker_index,
+                    "selection_metric": selection_metric,
+                    "selection_score_key": score_key,
+                    "selection_objective": selection_objective(selection_metric),
+                    "selection_score": dataset_metrics[score_key],
+                    **dataset_metrics,
+                }
+                results.append(result_row)
+                write_json(result_path, results)
+                continue
 
         print(f"[worker {worker_index}] scoring {teacher_name} with {metric_label}")
         t0 = time.perf_counter()
@@ -476,6 +557,7 @@ def run_worker(manifest_path: Path) -> None:
                 smoothing=manifest["grace_smoothing"],
                 partition_seed=manifest["seed"],
             )
+            torch.save(processed_gradients, processed_gradients_path)
         else:
             inferred_samples = infer_dataset(
                 model=model,
@@ -735,6 +817,11 @@ def run_controller(args: argparse.Namespace) -> None:
             print(f"[controller] resuming: reusing {result_path}")
             resumed_worker_count += 1
             continue
+        if existing_rows is not None:
+            print(
+                f"[controller] resuming partial worker {worker_name}: "
+                f"found {len(existing_rows)}/{len(worker_jobs)} completed teacher results in {result_path}"
+            )
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
@@ -746,10 +833,16 @@ def run_controller(args: argparse.Namespace) -> None:
 
         log_path = logs_dir / f"{worker_name}.log"
         log_handle = log_path.open("w", encoding="utf-8")
-        print(
-            f"[controller] launching {worker_name} with {len(worker_jobs)} teachers on "
-            f"{env['CUDA_VISIBLE_DEVICES'] or '<cpu>'}"
-        )
+        if existing_rows is not None:
+            print(
+                f"[controller] launching {worker_name} to resume remaining teachers on "
+                f"{env['CUDA_VISIBLE_DEVICES'] or '<cpu>'}; see {log_path}"
+            )
+        else:
+            print(
+                f"[controller] launching {worker_name} with {len(worker_jobs)} teachers on "
+                f"{env['CUDA_VISIBLE_DEVICES'] or '<cpu>'}"
+            )
         process = subprocess.Popen(
             [sys.executable, str(script_path), "--worker-manifest", str(manifest_path)],
             stdout=log_handle,
