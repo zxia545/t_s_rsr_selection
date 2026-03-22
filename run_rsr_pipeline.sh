@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source activate rsr_selection
+
+conda activate rsr_selection
+
+# check does current conda env is rsr_selection
+if [[ "$(conda info --envs | grep '*' | awk '{print $1}')" != "rsr_selection" ]]; then
+  echo "Please activate the conda environment 'rsr_selection' before running this script."
+  exit 1
+fi
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ $# -lt 1 ]]; then
