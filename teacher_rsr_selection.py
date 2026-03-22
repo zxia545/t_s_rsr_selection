@@ -156,6 +156,24 @@ def build_messages(system_text: str, prompt_text: str, response_text: str) -> Li
     return messages
 
 
+def jsonl_has_expected_row_count(path: Path, expected_count: int) -> bool:
+    if not path.exists():
+        return False
+    row_count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}: invalid JSON on line {line_no}: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise ValueError(f"{path}: line {line_no} is not a JSON object")
+            row_count += 1
+    return row_count == expected_count
+
+
 def prepare_teacher_job(
     source_path: Path,
     prepared_path: Path,
@@ -167,6 +185,15 @@ def prepare_teacher_job(
     prompt_field: str,
     response_field: str,
 ) -> Dict[str, object]:
+    if jsonl_has_expected_row_count(prepared_path, len(sampled_ids)):
+        return {
+            "teacher_name": teacher_name,
+            "source_path": str(source_path),
+            "prepared_path": str(prepared_path),
+            "sample_count": len(sampled_ids),
+            "prepared_messages_reused": True,
+        }
+
     selected_records: Dict[object, Dict] = {}
     for record in iter_records(source_path):
         is_valid, sample_id = validate_record(
@@ -204,6 +231,7 @@ def prepare_teacher_job(
         "source_path": str(source_path),
         "prepared_path": str(prepared_path),
         "sample_count": len(sampled_ids),
+        "prepared_messages_reused": False,
     }
 
 
@@ -360,21 +388,7 @@ def load_worker_result_rows(result_path: Path) -> Optional[List[Dict]]:
 
 
 def has_complete_sample_metrics(sample_metrics_path: Path, expected_count: int) -> bool:
-    if not sample_metrics_path.exists():
-        return False
-    row_count = 0
-    with sample_metrics_path.open("r", encoding="utf-8") as handle:
-        for line_no, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{sample_metrics_path}: invalid JSON on line {line_no}: {exc}") from exc
-            if not isinstance(payload, dict):
-                raise ValueError(f"{sample_metrics_path}: line {line_no} is not a JSON object")
-            row_count += 1
-    return row_count == expected_count
+    return jsonl_has_expected_row_count(sample_metrics_path, expected_count)
 
 
 def run_worker(manifest_path: Path) -> None:
@@ -634,7 +648,6 @@ def run_controller(args: argparse.Namespace) -> None:
     sampled_id_set = set(sampled_ids)
     write_json(output_root / "teacher_overview.json", teacher_overview)
 
-    print(f"[controller] preparing sampled messages for {sample_size} shared ids")
     prepared_dir = output_root / "prepared_messages"
     jobs = []
     for path in teacher_files:
@@ -653,6 +666,12 @@ def run_controller(args: argparse.Namespace) -> None:
                 response_field=args.response_field,
             )
         )
+    reused_prepared_count = sum(1 for job in jobs if job.get("prepared_messages_reused"))
+    rebuilt_prepared_count = len(jobs) - reused_prepared_count
+    print(
+        f"[controller] prepared messages for {sample_size} shared ids: "
+        f"reused {reused_prepared_count}, rebuilt {rebuilt_prepared_count}"
+    )
 
     visible_gpu_ids = detect_visible_gpu_ids()
     device_groups = build_device_groups(
