@@ -337,6 +337,46 @@ def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def load_existing_sampled_ids(sampled_ids_path: Path, common_ids: set) -> Optional[List[object]]:
+    if not sampled_ids_path.exists():
+        return None
+    payload = json.loads(sampled_ids_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"{sampled_ids_path} must contain a JSON array")
+    missing_ids = [sid for sid in payload if sid not in common_ids]
+    if missing_ids:
+        preview = ", ".join(json.dumps(x, ensure_ascii=False) for x in missing_ids[:10])
+        raise ValueError(f"{sampled_ids_path} contains ids that are no longer common across teachers: {preview}")
+    return payload
+
+
+def load_worker_result_rows(result_path: Path) -> Optional[List[Dict]]:
+    if not result_path.exists():
+        return None
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"{result_path} must contain a JSON array")
+    return payload
+
+
+def has_complete_sample_metrics(sample_metrics_path: Path, expected_count: int) -> bool:
+    if not sample_metrics_path.exists():
+        return False
+    row_count = 0
+    with sample_metrics_path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{sample_metrics_path}: invalid JSON on line {line_no}: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise ValueError(f"{sample_metrics_path}: line {line_no} is not a JSON object")
+            row_count += 1
+    return row_count == expected_count
+
+
 def run_worker(manifest_path: Path) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     jobs = manifest["jobs"]
@@ -354,6 +394,26 @@ def run_worker(manifest_path: Path) -> None:
     if uses_gradient_baseline(selection_metric) and manifest["batch_size"] != 1:
         raise ValueError(f"{metric_label} requires --batch-size 1 because gradients are computed per sample")
 
+    result_path = Path(manifest["result_path"])
+    existing_result_rows = load_worker_result_rows(result_path) or []
+    existing_result_by_teacher = {row["teacher_name"]: row for row in existing_result_rows}
+
+    completed_teacher_names = set()
+    for job in jobs:
+        teacher_name = job["teacher_name"]
+        sample_metrics_path = output_root / "sample_metrics" / f"{sanitize_name(teacher_name)}.jsonl"
+        existing_row = existing_result_by_teacher.get(teacher_name)
+        if existing_row is None:
+            continue
+        if has_complete_sample_metrics(sample_metrics_path, int(job["sample_count"])):
+            completed_teacher_names.add(teacher_name)
+
+    if len(completed_teacher_names) == len(jobs):
+        print(f"[worker {worker_index}] all {len(jobs)} teachers already completed; skipping worker")
+        ordered_rows = [existing_result_by_teacher[job["teacher_name"]] for job in jobs]
+        write_json(result_path, ordered_rows)
+        return
+
     model, tokenizer = load_model_and_tokenizer(
         model_path=manifest["model_path"],
         dtype=manifest["dtype"],
@@ -367,6 +427,11 @@ def run_worker(manifest_path: Path) -> None:
         teacher_name = job["teacher_name"]
         prepared_path = Path(job["prepared_path"])
         sample_metrics_path = output_root / "sample_metrics" / f"{sanitize_name(teacher_name)}.jsonl"
+        if teacher_name in completed_teacher_names:
+            print(f"[worker {worker_index}] resuming: skipping completed teacher {teacher_name}")
+            results.append(existing_result_by_teacher[teacher_name])
+            write_json(result_path, results)
+            continue
 
         print(f"[worker {worker_index}] scoring {teacher_name} with {metric_label}")
         t0 = time.perf_counter()
@@ -424,9 +489,7 @@ def run_worker(manifest_path: Path) -> None:
             **dataset_metrics,
         }
         results.append(result_row)
-
-    result_path = Path(manifest["result_path"])
-    write_json(result_path, results)
+        write_json(result_path, results)
     print(f"[worker {worker_index}] finished")
 
 
@@ -552,11 +615,23 @@ def run_controller(args: argparse.Namespace) -> None:
             f"using {sample_size}"
         )
 
-    rng = random.Random(args.seed)
-    sorted_common_ids = sorted(common_ids, key=json_default_sort_key)
-    sampled_ids = rng.sample(sorted_common_ids, k=sample_size)
+    sampled_ids_path = output_root / "sampled_ids.json"
+    existing_sampled_ids = load_existing_sampled_ids(sampled_ids_path, common_ids)
+    resumed_from_existing_sample = existing_sampled_ids is not None
+    if existing_sampled_ids is not None:
+        if len(existing_sampled_ids) != sample_size:
+            raise ValueError(
+                f"{sampled_ids_path} contains {len(existing_sampled_ids)} ids, expected {sample_size}. "
+                "Delete the old run folder if you want to start over with a different sample size."
+            )
+        sampled_ids = existing_sampled_ids
+        print(f"[controller] resuming with existing sampled ids from {sampled_ids_path}")
+    else:
+        rng = random.Random(args.seed)
+        sorted_common_ids = sorted(common_ids, key=json_default_sort_key)
+        sampled_ids = rng.sample(sorted_common_ids, k=sample_size)
+        write_json(sampled_ids_path, sampled_ids)
     sampled_id_set = set(sampled_ids)
-    write_json(output_root / "sampled_ids.json", sampled_ids)
     write_json(output_root / "teacher_overview.json", teacher_overview)
 
     print(f"[controller] preparing sampled messages for {sample_size} shared ids")
@@ -596,6 +671,8 @@ def run_controller(args: argparse.Namespace) -> None:
 
     script_path = Path(__file__).resolve()
     launched_workers = []
+    result_paths: List[Path] = []
+    resumed_worker_count = 0
     for worker_index, (device_group, worker_jobs) in enumerate(zip(device_groups, worker_job_groups)):
         if not worker_jobs:
             continue
@@ -624,6 +701,13 @@ def run_controller(args: argparse.Namespace) -> None:
             "jobs": worker_jobs,
         }
         write_json(manifest_path, manifest)
+        result_paths.append(result_path)
+
+        existing_rows = load_worker_result_rows(result_path)
+        if existing_rows is not None:
+            print(f"[controller] resuming: reusing {result_path}")
+            resumed_worker_count += 1
+            continue
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
@@ -648,9 +732,6 @@ def run_controller(args: argparse.Namespace) -> None:
         )
         launched_workers.append((worker_name, process, log_handle, log_path, result_path, device_group))
 
-    if not launched_workers:
-        raise RuntimeError("no workers were launched")
-
     for worker_name, process, log_handle, log_path, result_path, device_group in launched_workers:
         return_code = process.wait()
         log_handle.close()
@@ -662,11 +743,14 @@ def run_controller(args: argparse.Namespace) -> None:
         if not result_path.exists():
             raise RuntimeError(f"{worker_name} completed but did not produce {result_path}")
 
+    if not result_paths:
+        raise RuntimeError("no worker outputs were configured")
+
     ranking_rows: List[Dict] = []
-    for _, _, _, _, result_path, _ in launched_workers:
-        worker_rows = json.loads(result_path.read_text(encoding="utf-8"))
-        if not isinstance(worker_rows, list):
-            raise ValueError(f"{result_path} must contain a JSON array")
+    for result_path in result_paths:
+        worker_rows = load_worker_result_rows(result_path)
+        if worker_rows is None:
+            raise RuntimeError(f"missing worker result: {result_path}")
         ranking_rows.extend(worker_rows)
 
     if not ranking_rows:
@@ -758,8 +842,10 @@ def run_controller(args: argparse.Namespace) -> None:
         "grace_smoothing": args.grace_smoothing,
         "sample_size_requested": args.sample_size,
         "sample_size_used": sample_size,
+        "resumed_from_existing_sample": resumed_from_existing_sample,
+        "resumed_worker_count": resumed_worker_count,
         "seed": args.seed,
-        "sampled_ids_path": str(output_root / "sampled_ids.json"),
+        "sampled_ids_path": str(sampled_ids_path),
         "ranking_path": str(ranking_path),
         "ranking_tsv_path": str(ranking_tsv_path),
         "dataset_info_path": str(dataset_info_path) if dataset_info_path is not None else "",

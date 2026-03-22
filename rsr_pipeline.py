@@ -119,7 +119,7 @@ def resolve_path(value: Optional[str], base: Path) -> str:
     return str(path)
 
 
-def build_command(dataset_cfg: Dict, model_cfg: Dict, run_cfg: Dict, global_output_root: Path) -> Tuple[List[str], str]:
+def build_command(dataset_cfg: Dict, model_cfg: Dict, run_cfg: Dict, global_output_root: Path) -> Tuple[List[str], str, Path]:
     dataset_name = dataset_cfg["name"]
     model_name = model_cfg["name"]
     selection_metric = (
@@ -204,7 +204,7 @@ def build_command(dataset_cfg: Dict, model_cfg: Dict, run_cfg: Dict, global_outp
     if merged.get("copy_selected_to_output", True):
         args.append("--copy-selected-to-output")
 
-    return args, run_name
+    return args, run_name, output_root_path
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -236,9 +236,24 @@ def main() -> None:
     failures = []
 
     for dataset_cfg, model_cfg, run_cfg in iter_runs(config, selected_model_names, selected_dataset_names):
-        command, run_name = build_command(dataset_cfg, model_cfg, run_cfg, global_output_root)
+        command, run_name, output_root_path = build_command(dataset_cfg, model_cfg, run_cfg, global_output_root)
         print(f"[pipeline] run={run_name}")
         print("[pipeline] cmd:", " ".join(command))
+
+        final_dataset_dir = output_root_path / "final_dataset"
+        if final_dataset_dir.exists():
+            print(f"[pipeline] skip: found existing {final_dataset_dir}")
+            run_summaries.append(
+                {
+                    "run_name": run_name,
+                    "dataset": dataset_cfg["name"],
+                    "model": model_cfg["name"],
+                    "status": "skipped",
+                    "skip_reason": f"existing final_dataset at {final_dataset_dir}",
+                    "returncode": 0,
+                }
+            )
+            continue
 
         if args.dry_run:
             continue
@@ -248,6 +263,7 @@ def main() -> None:
             "run_name": run_name,
             "dataset": dataset_cfg["name"],
             "model": model_cfg["name"],
+            "status": "completed" if completed.returncode == 0 else "failed",
             "returncode": completed.returncode,
         }
         run_summaries.append(run_summary)
