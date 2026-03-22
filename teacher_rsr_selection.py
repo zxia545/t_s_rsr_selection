@@ -387,6 +387,14 @@ def load_worker_result_rows(result_path: Path) -> Optional[List[Dict]]:
     return payload
 
 
+def worker_result_covers_jobs(result_rows: Sequence[Dict], jobs: Sequence[Dict[str, object]]) -> bool:
+    if len(result_rows) != len(jobs):
+        return False
+    result_teacher_names = {row.get("teacher_name") for row in result_rows}
+    job_teacher_names = {job["teacher_name"] for job in jobs}
+    return result_teacher_names == job_teacher_names
+
+
 def has_complete_sample_metrics(sample_metrics_path: Path, expected_count: int) -> bool:
     return jsonl_has_expected_row_count(sample_metrics_path, expected_count)
 
@@ -723,7 +731,7 @@ def run_controller(args: argparse.Namespace) -> None:
         result_paths.append(result_path)
 
         existing_rows = load_worker_result_rows(result_path)
-        if existing_rows is not None:
+        if existing_rows is not None and worker_result_covers_jobs(existing_rows, worker_jobs):
             print(f"[controller] resuming: reusing {result_path}")
             resumed_worker_count += 1
             continue
