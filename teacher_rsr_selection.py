@@ -111,14 +111,15 @@ def collect_valid_ids(path: Path, id_field: str, prompt_field: str, response_fie
     return valid_ids, scanned
 
 
-def collect_teacher_overview_and_common_ids(
+def collect_teacher_overview_and_coverage(
     teacher_files: Sequence[Path],
     id_field: str,
     prompt_field: str,
     response_field: str,
-) -> Tuple[List[Dict[str, object]], set]:
+) -> Tuple[List[Dict[str, object]], set, Dict[object, int]]:
     common_ids: Optional[set] = None
     teacher_overview: List[Dict[str, object]] = []
+    id_coverage_counts: Dict[object, int] = {}
 
     for path in teacher_files:
         teacher_name = derive_teacher_name(path)
@@ -128,6 +129,8 @@ def collect_teacher_overview_and_common_ids(
             prompt_field=prompt_field,
             response_field=response_field,
         )
+        for sample_id in valid_ids:
+            id_coverage_counts[sample_id] = id_coverage_counts.get(sample_id, 0) + 1
         if common_ids is None:
             common_ids = set(valid_ids)
         else:
@@ -142,9 +145,11 @@ def collect_teacher_overview_and_common_ids(
         )
 
     common_valid_ids = common_ids or set()
+    union_valid_id_count = len(id_coverage_counts)
     for row in teacher_overview:
         row["common_valid_id_count"] = len(common_valid_ids)
-    return teacher_overview, common_valid_ids
+        row["union_valid_id_count"] = union_valid_id_count
+    return teacher_overview, common_valid_ids, id_coverage_counts
 
 
 def build_messages(system_text: str, prompt_text: str, response_text: str) -> List[Dict[str, str]]:
@@ -200,16 +205,8 @@ def prepare_teacher_job(
     system_field: str,
     prompt_field: str,
     response_field: str,
+    allow_missing_ids: bool = False,
 ) -> Dict[str, object]:
-    if jsonl_has_expected_row_count(prepared_path, len(sampled_ids)):
-        return {
-            "teacher_name": teacher_name,
-            "source_path": str(source_path),
-            "prepared_path": str(prepared_path),
-            "sample_count": len(sampled_ids),
-            "prepared_messages_reused": True,
-        }
-
     selected_records: Dict[object, Dict] = {}
     for record in iter_records(source_path):
         is_valid, sample_id = validate_record(
@@ -223,13 +220,24 @@ def prepare_teacher_job(
         selected_records[sample_id] = record
 
     missing_ids = [sid for sid in sampled_ids if sid not in selected_records]
-    if missing_ids:
+    if missing_ids and not allow_missing_ids:
         preview = ", ".join(json.dumps(x, ensure_ascii=False) for x in missing_ids[:10])
         raise ValueError(f"{source_path}: missing sampled ids after filtering: {preview}")
+    available_sample_ids = [sid for sid in sampled_ids if sid in selected_records]
+    expected_count = len(available_sample_ids)
+    if jsonl_has_expected_row_count(prepared_path, expected_count):
+        return {
+            "teacher_name": teacher_name,
+            "source_path": str(source_path),
+            "prepared_path": str(prepared_path),
+            "sample_count": expected_count,
+            "missing_sample_count": len(missing_ids),
+            "prepared_messages_reused": True,
+        }
 
     prepared_path.parent.mkdir(parents=True, exist_ok=True)
     with prepared_path.open("w", encoding="utf-8") as handle:
-        for sample_id in sampled_ids:
+        for sample_id in available_sample_ids:
             record = selected_records[sample_id]
             system_text = normalize_text(record.get(system_field))
             prompt_text = normalize_text(record.get(prompt_field))
@@ -246,7 +254,8 @@ def prepare_teacher_job(
         "teacher_name": teacher_name,
         "source_path": str(source_path),
         "prepared_path": str(prepared_path),
-        "sample_count": len(sampled_ids),
+        "sample_count": expected_count,
+        "missing_sample_count": len(missing_ids),
         "prepared_messages_reused": False,
     }
 
@@ -314,6 +323,7 @@ def write_tsv(path: Path, rows: Sequence[Dict]) -> None:
 
 SELECTION_SCORE_KEYS = {
     "rsr": "rank_surprisal_ratio",
+    "rsr_item": "rank_surprisal_ratio",
     "grace": "grace",
     "g_norm": "g_norm",
     "g_vendi": "g_vendi",
@@ -321,6 +331,7 @@ SELECTION_SCORE_KEYS = {
 
 SELECTION_LABELS = {
     "rsr": "RSR",
+    "rsr_item": "RSR-Item",
     "grace": "GRACE",
     "g_norm": "G-Norm",
     "g_vendi": "G-Vendi",
@@ -331,6 +342,10 @@ DESCENDING_SELECTION_METRICS = {"g_vendi"}
 
 def uses_gradient_baseline(selection_metric: str) -> bool:
     return selection_metric in {"grace", "g_norm", "g_vendi"}
+
+
+def uses_item_level_selection(selection_metric: str) -> bool:
+    return selection_metric == "rsr_item"
 
 
 def selection_score_key(selection_metric: str) -> str:
@@ -381,16 +396,16 @@ def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def load_existing_sampled_ids(sampled_ids_path: Path, common_ids: set) -> Optional[List[object]]:
+def load_existing_sampled_ids(sampled_ids_path: Path, allowed_ids: set, allowed_label: str) -> Optional[List[object]]:
     if not sampled_ids_path.exists():
         return None
     payload = json.loads(sampled_ids_path.read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         raise ValueError(f"{sampled_ids_path} must contain a JSON array")
-    missing_ids = [sid for sid in payload if sid not in common_ids]
+    missing_ids = [sid for sid in payload if sid not in allowed_ids]
     if missing_ids:
         preview = ", ".join(json.dumps(x, ensure_ascii=False) for x in missing_ids[:10])
-        raise ValueError(f"{sampled_ids_path} contains ids that are no longer common across teachers: {preview}")
+        raise ValueError(f"{sampled_ids_path} contains ids that are no longer in the {allowed_label} set: {preview}")
     return payload
 
 
@@ -429,6 +444,155 @@ def compute_rsr_dataset_metrics_from_sample_metrics(sample_metrics: Sequence[Dic
         "avg_surprisal": sum_avg_surprisal / count,
         "rank_surprisal_ratio": sum_avg_rank / max(sum_avg_surprisal, eps),
     }
+
+
+def build_coverage_histogram(id_coverage_counts: Dict[object, int]) -> Dict[str, int]:
+    histogram: Dict[str, int] = {}
+    for teacher_count in id_coverage_counts.values():
+        key = str(int(teacher_count))
+        histogram[key] = histogram.get(key, 0) + 1
+    return {key: histogram[key] for key in sorted(histogram, key=int)}
+
+
+def load_valid_records_by_id(
+    source_path: Path,
+    target_ids: Sequence[object],
+    id_field: str,
+    prompt_field: str,
+    response_field: str,
+) -> Dict[object, Dict]:
+    target_id_set = set(target_ids)
+    selected_records: Dict[object, Dict] = {}
+    for record in iter_records(source_path):
+        is_valid, sample_id = validate_record(
+            record,
+            id_field=id_field,
+            prompt_field=prompt_field,
+            response_field=response_field,
+        )
+        if not is_valid or sample_id not in target_id_set:
+            continue
+        selected_records[sample_id] = record
+
+    missing_ids = [sample_id for sample_id in target_ids if sample_id not in selected_records]
+    if missing_ids:
+        preview = ", ".join(json.dumps(x, ensure_ascii=False) for x in missing_ids[:10])
+        raise ValueError(f"{source_path}: missing selected ids while materializing final dataset: {preview}")
+    return selected_records
+
+
+def build_rsr_item_selection_rows(
+    ranking_rows: Sequence[Dict],
+    sampled_ids: Sequence[object],
+    min_teachers_per_item: int,
+    score_key: str,
+) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    sampled_id_set = set(sampled_ids)
+    candidates_by_id: Dict[object, List[Dict]] = {}
+    for ranking_row in ranking_rows:
+        teacher_name = ranking_row["teacher_name"]
+        source_path = ranking_row["source_path"]
+        sample_metrics = load_jsonl_rows(Path(ranking_row["sample_metrics_path"]))
+        for sample_metric in sample_metrics:
+            sample_id = sample_metric["sample_id"]
+            if sample_id not in sampled_id_set:
+                continue
+            selection_score = float(sample_metric[score_key])
+            candidates_by_id.setdefault(sample_id, []).append(
+                {
+                    "sample_id": sample_id,
+                    "teacher_name": teacher_name,
+                    "source_path": source_path,
+                    "selection_score": selection_score,
+                    score_key: selection_score,
+                    "avg_rank_clip": float(sample_metric["avg_rank_clip"]),
+                    "avg_surprisal": float(sample_metric["avg_surprisal"]),
+                    "resp_token_length": int(sample_metric["resp_token_length"]),
+                }
+            )
+
+    selection_rows: List[Dict] = []
+    skipped_rows: List[Dict] = []
+    teacher_usage: Dict[str, Dict[str, object]] = {}
+    for sample_id in sampled_ids:
+        candidates = sorted(
+            candidates_by_id.get(sample_id, []),
+            key=lambda row: (row["selection_score"], row["teacher_name"], row["source_path"]),
+        )
+        candidate_count = len(candidates)
+        if candidate_count < min_teachers_per_item:
+            skipped_rows.append(
+                {
+                    "sample_id": sample_id,
+                    "available_teacher_count": candidate_count,
+                    "required_teacher_count": min_teachers_per_item,
+                    "skip_reason": "insufficient_scored_teachers",
+                }
+            )
+            continue
+
+        winner = candidates[0]
+        selection_row = {
+            "sample_id": sample_id,
+            "available_teacher_count": candidate_count,
+            "selected_teacher_name": winner["teacher_name"],
+            "selected_source_path": winner["source_path"],
+            "selection_score": winner["selection_score"],
+            score_key: winner[score_key],
+            "avg_rank_clip": winner["avg_rank_clip"],
+            "avg_surprisal": winner["avg_surprisal"],
+            "resp_token_length": winner["resp_token_length"],
+        }
+        selection_rows.append(selection_row)
+
+        usage_row = teacher_usage.setdefault(
+            winner["teacher_name"],
+            {
+                "teacher_name": winner["teacher_name"],
+                "source_path": winner["source_path"],
+                "selected_item_count": 0,
+                "selection_score_sum": 0.0,
+            },
+        )
+        usage_row["selected_item_count"] += 1
+        usage_row["selection_score_sum"] += winner["selection_score"]
+
+    teacher_usage_rows = []
+    for usage_row in teacher_usage.values():
+        selected_item_count = int(usage_row["selected_item_count"])
+        teacher_usage_rows.append(
+            {
+                "teacher_name": usage_row["teacher_name"],
+                "source_path": usage_row["source_path"],
+                "selected_item_count": selected_item_count,
+                "avg_selected_item_score": usage_row["selection_score_sum"] / max(selected_item_count, 1),
+            }
+        )
+    teacher_usage_rows.sort(key=lambda row: (-row["selected_item_count"], row["avg_selected_item_score"], row["teacher_name"]))
+    return selection_rows, skipped_rows, teacher_usage_rows
+
+
+def materialize_rsr_item_records(
+    selection_rows: Sequence[Dict],
+    id_field: str,
+    prompt_field: str,
+    response_field: str,
+) -> List[Dict]:
+    sample_ids_by_source: Dict[str, List[object]] = {}
+    for row in selection_rows:
+        sample_ids_by_source.setdefault(row["selected_source_path"], []).append(row["sample_id"])
+
+    records_by_source: Dict[str, Dict[object, Dict]] = {}
+    for source_path, source_sample_ids in sample_ids_by_source.items():
+        records_by_source[source_path] = load_valid_records_by_id(
+            source_path=Path(source_path),
+            target_ids=source_sample_ids,
+            id_field=id_field,
+            prompt_field=prompt_field,
+            response_field=response_field,
+        )
+
+    return [records_by_source[row["selected_source_path"]][row["sample_id"]] for row in selection_rows]
 
 
 def run_worker(manifest_path: Path) -> None:
@@ -613,9 +777,9 @@ def build_controller_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset-export-dir",
         default="",
-        help="Where the winning full teacher file is copied. Defaults to dataset/<metric>_selected_teachers.",
+        help="Where the selected dataset artifact is written. Defaults to dataset/<metric>_selected_teachers.",
     )
-    parser.add_argument("--dataset-entry-name", default="", help="Optional dataset_info key for the selected teacher copy.")
+    parser.add_argument("--dataset-entry-name", default="", help="Optional dataset_info key for the selected dataset artifact.")
     parser.add_argument("--teacher-glob", default="*.jsonl", help="Glob used to discover teacher files.")
     parser.add_argument("--id-field", default="id")
     parser.add_argument("--system-field", default="system")
@@ -624,10 +788,21 @@ def build_controller_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--selection-metric",
         default="rsr",
-        choices=["rsr", "grace", "g_norm", "g_vendi"],
-        help="Teacher-selection score: token-level RSR, dataset-level GRACE, or GRACE paper baselines.",
+        choices=["rsr", "rsr_item", "grace", "g_norm", "g_vendi"],
+        help="Teacher-selection score: teacher-level RSR, item-level RSR, dataset-level GRACE, or GRACE paper baselines.",
     )
-    parser.add_argument("--sample-size", type=int, default=200)
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=200,
+        help="Number of shared ids to sample for teacher-level selection. Ignored by rsr_item, which scores all eligible items.",
+    )
+    parser.add_argument(
+        "--min-teachers-per-item",
+        type=int,
+        default=1,
+        help="For --selection-metric rsr_item, keep an item only if at least this many teachers have a scored response.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32", "auto"])
@@ -662,7 +837,11 @@ def build_controller_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-flash-attn", action="store_true")
     parser.add_argument("--gpus-per-worker", type=int, default=1)
     parser.add_argument("--max-workers", type=int, default=0, help="0 means auto from visible GPUs.")
-    parser.add_argument("--copy-selected-to-output", action="store_true", help="Also copy the winning original teacher file into output_root.")
+    parser.add_argument(
+        "--copy-selected-to-output",
+        action="store_true",
+        help="Also copy the selected original teacher file into output_root when a single teacher wins.",
+    )
     parser.add_argument("--worker-manifest", default="", help=argparse.SUPPRESS)
     return parser
 
@@ -672,16 +851,20 @@ def run_controller(args: argparse.Namespace) -> None:
     score_key = selection_score_key(args.selection_metric)
     metric_label = selection_label(args.selection_metric)
     grace_projection_seed = args.seed if args.grace_projection_seed < 0 else args.grace_projection_seed
+    item_level_selection = uses_item_level_selection(args.selection_metric)
     teacher_folder = Path(args.teacher_folder).resolve()
     if not teacher_folder.exists():
         raise FileNotFoundError(f"teacher folder does not exist: {teacher_folder}")
+    if item_level_selection and args.min_teachers_per_item < 1:
+        raise ValueError("--min-teachers-per-item must be >= 1")
 
     if args.output_root:
         output_root = Path(args.output_root).resolve()
     else:
+        size_label = "all" if item_level_selection else f"n{args.sample_size}"
         output_root = (
             Path(f"dataset/{args.selection_metric}_teacher_selection")
-            / f"{sanitize_name(model_name)}__{sanitize_name(teacher_folder.name)}__n{args.sample_size}__seed{args.seed}"
+            / f"{sanitize_name(model_name)}__{sanitize_name(teacher_folder.name)}__{size_label}__seed{args.seed}"
         ).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -698,70 +881,125 @@ def run_controller(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"no teacher files matched {args.teacher_glob!r} under {teacher_folder}")
 
     print(f"[controller] discovered {len(teacher_files)} teacher files")
-    teacher_overview, common_ids = collect_teacher_overview_and_common_ids(
+    teacher_overview, common_ids, id_coverage_counts = collect_teacher_overview_and_coverage(
         teacher_files=teacher_files,
         id_field=args.id_field,
         prompt_field=args.prompt_field,
         response_field=args.response_field,
     )
-    if not common_ids:
-        raise RuntimeError("no common valid sample ids were found across teachers")
-
-    available_count = len(common_ids)
-    sample_size = min(args.sample_size, available_count)
-    if sample_size <= 0:
-        raise ValueError("--sample-size must be >= 1")
-    if uses_gradient_baseline(args.selection_metric) and sample_size < 2:
-        raise ValueError(f"{metric_label} requires at least 2 shared samples")
-    if sample_size < args.sample_size:
-        print(
-            f"[controller] requested sample_size={args.sample_size}, but only {available_count} common ids are available; "
-            f"using {sample_size}"
+    coverage_summary = {
+        "teacher_count": len(teacher_files),
+        "union_valid_id_count": len(id_coverage_counts),
+        "common_valid_id_count": len(common_ids),
+        "coverage_histogram": build_coverage_histogram(id_coverage_counts),
+    }
+    if item_level_selection:
+        candidate_ids = {
+            sample_id for sample_id, teacher_count in id_coverage_counts.items() if teacher_count >= args.min_teachers_per_item
+        }
+        if not candidate_ids:
+            raise RuntimeError(
+                f"no valid sample ids have at least {args.min_teachers_per_item} teacher responses for item-level RSR"
+            )
+        available_count = len(candidate_ids)
+        coverage_summary.update(
+            {
+                "candidate_id_mode": "union_with_min_teacher_threshold",
+                "candidate_id_count": available_count,
+                "min_teachers_per_item": args.min_teachers_per_item,
+            }
         )
+        print(
+            f"[controller] item-level RSR candidates: {available_count} ids "
+            f"(union={len(id_coverage_counts)}, common={len(common_ids)}, "
+            f"min_teachers_per_item={args.min_teachers_per_item})"
+        )
+        sampled_id_label = f"eligible ids with at least {args.min_teachers_per_item} teacher responses"
+    else:
+        if not common_ids:
+            raise RuntimeError("no common valid sample ids were found across teachers")
+        candidate_ids = common_ids
+        available_count = len(candidate_ids)
+        coverage_summary.update(
+            {
+                "candidate_id_mode": "common_intersection",
+                "candidate_id_count": available_count,
+            }
+        )
+        sampled_id_label = "common ids across teachers"
 
     sampled_ids_path = output_root / "sampled_ids.json"
-    existing_sampled_ids = load_existing_sampled_ids(sampled_ids_path, common_ids)
+    existing_sampled_ids = load_existing_sampled_ids(sampled_ids_path, candidate_ids, sampled_id_label)
     resumed_from_existing_sample = existing_sampled_ids is not None
-    if existing_sampled_ids is not None:
-        if len(existing_sampled_ids) != sample_size:
-            raise ValueError(
-                f"{sampled_ids_path} contains {len(existing_sampled_ids)} ids, expected {sample_size}. "
-                "Delete the old run folder if you want to start over with a different sample size."
-            )
-        sampled_ids = existing_sampled_ids
-        print(f"[controller] resuming with existing sampled ids from {sampled_ids_path}")
+    if item_level_selection:
+        sampled_ids = sorted(candidate_ids, key=json_default_sort_key)
+        sample_size = len(sampled_ids)
+        if sample_size <= 0:
+            raise RuntimeError("rsr_item did not find any eligible items to score")
+        if existing_sampled_ids != sampled_ids:
+            write_json(sampled_ids_path, sampled_ids)
+        elif existing_sampled_ids is not None:
+            print(f"[controller] resuming with existing eligible id list from {sampled_ids_path}")
     else:
-        rng = random.Random(args.seed)
-        sorted_common_ids = sorted(common_ids, key=json_default_sort_key)
-        sampled_ids = rng.sample(sorted_common_ids, k=sample_size)
-        write_json(sampled_ids_path, sampled_ids)
+        sample_size = min(args.sample_size, available_count)
+        if sample_size <= 0:
+            raise ValueError("--sample-size must be >= 1")
+        if uses_gradient_baseline(args.selection_metric) and sample_size < 2:
+            raise ValueError(f"{metric_label} requires at least 2 shared samples")
+        if sample_size < args.sample_size:
+            print(
+                f"[controller] requested sample_size={args.sample_size}, but only {available_count} {sampled_id_label} are available; "
+                f"using {sample_size}"
+            )
+
+        if existing_sampled_ids is not None:
+            if len(existing_sampled_ids) != sample_size:
+                raise ValueError(
+                    f"{sampled_ids_path} contains {len(existing_sampled_ids)} ids, expected {sample_size}. "
+                    "Delete the old run folder if you want to start over with a different sample size."
+                )
+            sampled_ids = existing_sampled_ids
+            print(f"[controller] resuming with existing sampled ids from {sampled_ids_path}")
+        else:
+            rng = random.Random(args.seed)
+            sorted_candidate_ids = sorted(candidate_ids, key=json_default_sort_key)
+            sampled_ids = rng.sample(sorted_candidate_ids, k=sample_size)
+            write_json(sampled_ids_path, sampled_ids)
     sampled_id_set = set(sampled_ids)
     write_json(output_root / "teacher_overview.json", teacher_overview)
+    write_json(output_root / "coverage_summary.json", coverage_summary)
 
     prepared_dir = output_root / "prepared_messages"
     jobs = []
+    zero_sample_teachers = []
     for path in teacher_files:
         teacher_name = derive_teacher_name(path)
         prepared_path = prepared_dir / f"{sanitize_name(teacher_name)}.jsonl"
-        jobs.append(
-            prepare_teacher_job(
-                source_path=path,
-                prepared_path=prepared_path,
-                teacher_name=teacher_name,
-                sampled_ids=sampled_ids,
-                sampled_id_set=sampled_id_set,
-                id_field=args.id_field,
-                system_field=args.system_field,
-                prompt_field=args.prompt_field,
-                response_field=args.response_field,
-            )
+        job = prepare_teacher_job(
+            source_path=path,
+            prepared_path=prepared_path,
+            teacher_name=teacher_name,
+            sampled_ids=sampled_ids,
+            sampled_id_set=sampled_id_set,
+            id_field=args.id_field,
+            system_field=args.system_field,
+            prompt_field=args.prompt_field,
+            response_field=args.response_field,
+            allow_missing_ids=item_level_selection,
         )
+        if item_level_selection and int(job["sample_count"]) == 0:
+            zero_sample_teachers.append(job)
+            continue
+        jobs.append(job)
     reused_prepared_count = sum(1 for job in jobs if job.get("prepared_messages_reused"))
     rebuilt_prepared_count = len(jobs) - reused_prepared_count
-    print(
-        f"[controller] prepared messages for {sample_size} shared ids: "
-        f"reused {reused_prepared_count}, rebuilt {rebuilt_prepared_count}"
-    )
+    item_label = "eligible ids" if item_level_selection else "sampled ids"
+    print(f"[controller] prepared messages for {sample_size} {item_label}: reused {reused_prepared_count}, rebuilt {rebuilt_prepared_count}")
+    if zero_sample_teachers:
+        write_json(output_root / "zero_sample_teachers.json", zero_sample_teachers)
+        print(f"[controller] skipped {len(zero_sample_teachers)} teachers with 0 sampled items after filtering")
+    if not jobs:
+        raise RuntimeError("no teacher jobs contain sampled items to score")
 
     visible_gpu_ids = detect_visible_gpu_ids()
     device_groups = build_device_groups(
@@ -885,25 +1123,78 @@ def run_controller(args: argparse.Namespace) -> None:
     write_json(ranking_path, ranking_rows)
     write_tsv(ranking_tsv_path, ranking_rows)
 
-    best_row = ranking_rows[0]
-    best_teacher_name = best_row["teacher_name"]
-    best_source_path = Path(best_row["source_path"])
-
-    dataset_entry_name = args.dataset_entry_name or (
-        f"{args.selection_metric}_selected__{sanitize_name(model_name)}__n{sample_size}__{sanitize_name(best_teacher_name)}"
-    )
-
     output_final_dir = output_root / "final_dataset"
     output_final_dir.mkdir(parents=True, exist_ok=True)
-    output_selected_copy_path = output_final_dir / f"{dataset_entry_name}.jsonl"
-    shutil.copy2(best_source_path, output_selected_copy_path)
     output_dataset_info_path = output_final_dir / "dataset_info.json"
 
     selected_dataset_copy_path = None
     global_dataset_info = {}
-    if dataset_export_dir is not None:
-        selected_dataset_copy_path = dataset_export_dir / f"{dataset_entry_name}.jsonl"
-        shutil.copy2(best_source_path, selected_dataset_copy_path)
+    item_selection_path = ""
+    item_selection_tsv_path = ""
+    skipped_items_path = ""
+    teacher_usage_path = ""
+    teacher_usage_tsv_path = ""
+    selected_item_count = 0
+    skipped_item_count = 0
+
+    if item_level_selection:
+        item_selection_rows, skipped_item_rows, teacher_usage_rows = build_rsr_item_selection_rows(
+            ranking_rows=ranking_rows,
+            sampled_ids=sampled_ids,
+            min_teachers_per_item=args.min_teachers_per_item,
+            score_key=score_key,
+        )
+        if not item_selection_rows:
+            raise RuntimeError("item-level RSR did not produce any selected items")
+
+        item_selection_json_path = output_root / "item_selection.json"
+        item_selection_table_path = output_root / "item_selection.tsv"
+        skipped_items_json_path = output_root / "item_selection_skipped.json"
+        teacher_usage_json_path = output_root / "selected_teacher_usage.json"
+        teacher_usage_table_path = output_root / "selected_teacher_usage.tsv"
+        write_json(item_selection_json_path, item_selection_rows)
+        write_tsv(item_selection_table_path, item_selection_rows)
+        write_json(skipped_items_json_path, skipped_item_rows)
+        write_json(teacher_usage_json_path, teacher_usage_rows)
+        write_tsv(teacher_usage_table_path, teacher_usage_rows)
+
+        item_selection_path = str(item_selection_json_path)
+        item_selection_tsv_path = str(item_selection_table_path)
+        skipped_items_path = str(skipped_items_json_path)
+        teacher_usage_path = str(teacher_usage_json_path)
+        teacher_usage_tsv_path = str(teacher_usage_table_path)
+        selected_item_count = len(item_selection_rows)
+        skipped_item_count = len(skipped_item_rows)
+
+        dataset_entry_name = args.dataset_entry_name or (
+            f"{args.selection_metric}_selected__{sanitize_name(model_name)}__n{selected_item_count}"
+            f"__{sanitize_name(teacher_folder.name)}"
+        )
+        output_selected_copy_path = output_final_dir / f"{dataset_entry_name}.jsonl"
+        final_rows = materialize_rsr_item_records(
+            selection_rows=item_selection_rows,
+            id_field=args.id_field,
+            prompt_field=args.prompt_field,
+            response_field=args.response_field,
+        )
+        write_jsonl(output_selected_copy_path, final_rows)
+
+        if dataset_export_dir is not None:
+            selected_dataset_copy_path = dataset_export_dir / f"{dataset_entry_name}.jsonl"
+            write_jsonl(selected_dataset_copy_path, final_rows)
+    else:
+        best_row = ranking_rows[0]
+        best_teacher_name = best_row["teacher_name"]
+        best_source_path = Path(best_row["source_path"])
+        dataset_entry_name = args.dataset_entry_name or (
+            f"{args.selection_metric}_selected__{sanitize_name(model_name)}__n{sample_size}__{sanitize_name(best_teacher_name)}"
+        )
+        output_selected_copy_path = output_final_dir / f"{dataset_entry_name}.jsonl"
+        shutil.copy2(best_source_path, output_selected_copy_path)
+
+        if dataset_export_dir is not None:
+            selected_dataset_copy_path = dataset_export_dir / f"{dataset_entry_name}.jsonl"
+            shutil.copy2(best_source_path, selected_dataset_copy_path)
 
     if dataset_info_path is not None:
         if selected_dataset_copy_path is None:
@@ -934,7 +1225,7 @@ def run_controller(args: argparse.Namespace) -> None:
     }
     write_json(output_dataset_info_path, output_dataset_info)
 
-    if args.copy_selected_to_output:
+    if args.copy_selected_to_output and not item_level_selection:
         selected_teacher_copy_path = output_root / "selected_teacher" / best_source_path.name
         selected_teacher_copy_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(best_source_path, selected_teacher_copy_path)
@@ -944,7 +1235,10 @@ def run_controller(args: argparse.Namespace) -> None:
         "teacher_folder": str(teacher_folder),
         "teacher_glob": args.teacher_glob,
         "teacher_count": len(teacher_files),
-        "common_valid_id_count": available_count,
+        "union_valid_id_count": len(id_coverage_counts),
+        "common_valid_id_count": len(common_ids),
+        "candidate_id_count": available_count,
+        "candidate_id_mode": coverage_summary["candidate_id_mode"],
         "model_path": args.model_path,
         "model_name": model_name,
         "selection_metric": args.selection_metric,
@@ -960,12 +1254,15 @@ def run_controller(args: argparse.Namespace) -> None:
         "grace_projection_chunk_size": args.grace_projection_chunk_size,
         "grace_num_partitions": args.grace_num_partitions,
         "grace_smoothing": args.grace_smoothing,
-        "sample_size_requested": args.sample_size,
+        "sample_size_requested": args.sample_size if not item_level_selection else None,
         "sample_size_used": sample_size,
+        "uses_all_eligible_items": item_level_selection,
+        "min_teachers_per_item": args.min_teachers_per_item,
         "resumed_from_existing_sample": resumed_from_existing_sample,
         "resumed_worker_count": resumed_worker_count,
         "seed": args.seed,
         "sampled_ids_path": str(sampled_ids_path),
+        "coverage_summary_path": str(output_root / "coverage_summary.json"),
         "ranking_path": str(ranking_path),
         "ranking_tsv_path": str(ranking_tsv_path),
         "dataset_info_path": str(dataset_info_path) if dataset_info_path is not None else "",
@@ -973,16 +1270,32 @@ def run_controller(args: argparse.Namespace) -> None:
         "selected_dataset_copy_path": str(selected_dataset_copy_path) if selected_dataset_copy_path is not None else "",
         "selected_output_copy_path": str(output_selected_copy_path),
         "output_dataset_info_path": str(output_dataset_info_path),
-        "best_teacher": best_row,
+        "item_selection_path": item_selection_path,
+        "item_selection_tsv_path": item_selection_tsv_path,
+        "item_selection_skipped_path": skipped_items_path,
+        "selected_teacher_usage_path": teacher_usage_path,
+        "selected_teacher_usage_tsv_path": teacher_usage_tsv_path,
+        "selected_item_count": selected_item_count,
+        "skipped_item_count": skipped_item_count,
+        "scored_teacher_count": len(ranking_rows),
+        "zero_sample_teacher_count": len(zero_sample_teachers),
         "visible_gpu_ids": visible_gpu_ids,
         "gpus_per_worker": args.gpus_per_worker,
         "worker_device_groups": device_groups,
         "global_dataset_info_entry": global_dataset_info.get(dataset_entry_name, {}),
     }
+    if item_level_selection:
+        summary["top_selected_teacher"] = teacher_usage_rows[0] if teacher_usage_rows else {}
+    else:
+        summary["best_teacher"] = best_row
     write_json(output_root / "run_summary.json", summary)
 
     print(f"[controller] ranking saved to {ranking_path}")
-    print(f"[controller] best teacher: {best_teacher_name} ({metric_label}={best_row[score_key]:.6f})")
+    if item_level_selection:
+        print(f"[controller] item selection saved to {item_selection_path}")
+        print(f"[controller] selected {selected_item_count} items with item-level {metric_label}")
+    else:
+        print(f"[controller] best teacher: {best_teacher_name} ({metric_label}={best_row[score_key]:.6f})")
     print(f"[controller] selected dataset copy: {output_selected_copy_path}")
     if selected_dataset_copy_path is not None:
         print(f"[controller] exported dataset copy: {selected_dataset_copy_path}")

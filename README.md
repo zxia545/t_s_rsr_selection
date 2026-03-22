@@ -39,6 +39,9 @@ It is designed for the workflow you described:
 - `configs/rsr_pipeline.example_rsr.json`
   - Explicit RSR batch config.
 
+- `configs/rsr_pipeline.example_rsr_item.json`
+  - Explicit item-level RSR batch config.
+
 - `configs/rsr_pipeline_example_test_grace.json`
   - Tiny GRACE dry-run config.
 
@@ -125,12 +128,29 @@ python teacher_rsr_selection.py \
   --copy-selected-to-output
 ```
 
-For the original RSR selector, use `--selection-metric rsr`.
+For the original teacher-level RSR selector, use `--selection-metric rsr`.
+
+For item-level trajectory selection, use `--selection-metric rsr_item`. This mode scores every eligible item against every available teacher response, picks the lowest-RSR response per item, and writes a mixed final dataset instead of copying one winning teacher file.
+
+Example:
+
+```bash
+python teacher_rsr_selection.py \
+  --teacher-folder dataset/gsm8k_teacher_output \
+  --model-path Qwen/Qwen2.5-0.5B-Instruct \
+  --model-name qwen2.5-0.5b-instruct \
+  --selection-metric rsr_item \
+  --min-teachers-per-item 5 \
+  --output-root outputs/gsm8k_qwen05b_rsr_item
+```
 
 ### Supported Metrics
 
 - `rsr`
   - Rank Surprisal Ratio on sampled responses.
+
+- `rsr_item`
+  - Item-level Rank Surprisal Ratio. Each eligible id is selected independently from the available teacher responses with the lowest RSR score.
 
 - `grace`
   - Dataset-level GRACE score from the RSR paper setup: sample 200 trajectories, compute one projected student gradient per sample, split into folds, and average `Tr(Σ_hat_bg^{-1} Σ_test)`.
@@ -169,10 +189,13 @@ For the original RSR selector, use `--selection-metric rsr`.
   - Field used as the assistant response to be scored.
 
 - `--selection-metric`
-  - One of `rsr`, `grace`, `g_norm`, or `g_vendi`.
+  - One of `rsr`, `rsr_item`, `grace`, `g_norm`, or `g_vendi`.
 
 - `--sample-size`
-  - Number of shared ids to sample across teachers.
+  - Number of shared ids to sample across teachers for `rsr`, `grace`, `g_norm`, and `g_vendi`. Ignored by `rsr_item`.
+
+- `--min-teachers-per-item`
+  - Only used by `rsr_item`. Keep an item only if at least this many teachers have a valid scored response for that id.
 
 - `--grace-projection-dim`
   - Output dimension for projected gradients when using gradient baselines.
@@ -223,6 +246,12 @@ outputs/gsm8k_qwen05b/
 
 - `teacher_ranking.json`
   - Full ranking sorted by the configured selection metric.
+
+- `item_selection.json`
+  - Only for `rsr_item`. Per-id winner list with the chosen teacher and its RSR score.
+
+- `selected_teacher_usage.json`
+  - Only for `rsr_item`. Counts how many items each teacher contributed to the mixed dataset.
 
 - `teacher_ranking.tsv`
   - Same ranking in tabular form.
@@ -402,13 +431,14 @@ For each run:
 
 1. Discover all teacher files.
 2. Validate records using the configured `id/prompt/response` fields.
-3. Intersect valid ids across all teachers.
-4. Sample `sample_size` shared ids with the configured seed.
-5. Convert records into chat-format messages.
-6. Score each teacher with the student model using the configured selection metric.
-7. Rank teachers according to that metric's objective.
-8. Copy the best teacher file into output locations.
-9. Write ranking artifacts and dataset info files.
+3. Build the candidate id set.
+4. For `rsr` / `grace` / `g_norm` / `g_vendi`, sample `sample_size` shared ids with the configured seed.
+5. For `rsr_item`, use all eligible ids that satisfy `min_teachers_per_item`.
+6. Convert records into chat-format messages.
+7. Score each teacher with the student model using the configured selection metric.
+8. Rank teachers according to that metric's objective.
+9. For `rsr_item`, select the best response per id; otherwise copy the best teacher file.
+10. Write ranking artifacts and dataset info files.
 
 - For `rsr`, smaller `rank_surprisal_ratio` is better.
 - For `grace`, smaller `grace` is better.

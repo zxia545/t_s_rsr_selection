@@ -141,10 +141,15 @@ def build_command(dataset_cfg: Dict, model_cfg: Dict, run_cfg: Dict, global_outp
     dataset_entry_name = run_cfg.get("dataset_entry_name")
     if not dataset_entry_name:
         dataset_entry_prefix = dataset_cfg.get("dataset_entry_prefix", f"{selection_metric}_selected")
-        dataset_entry_name = (
-            f"{dataset_entry_prefix}__{sanitize_name(model_name)}__n{run_cfg.get('sample_size', dataset_cfg.get('sample_size', 200))}"
-            f"__{sanitize_name(dataset_name)}"
-        )
+        if selection_metric == "rsr_item":
+            dataset_entry_name = (
+                f"{dataset_entry_prefix}__{sanitize_name(model_name)}__all__{sanitize_name(dataset_name)}"
+            )
+        else:
+            dataset_entry_name = (
+                f"{dataset_entry_prefix}__{sanitize_name(model_name)}__n{run_cfg.get('sample_size', dataset_cfg.get('sample_size', 200))}"
+                f"__{sanitize_name(dataset_name)}"
+            )
 
     args = [
         sys.executable,
@@ -171,6 +176,7 @@ def build_command(dataset_cfg: Dict, model_cfg: Dict, run_cfg: Dict, global_outp
         ("response_field", "--response-field"),
         ("selection_metric", "--selection-metric"),
         ("sample_size", "--sample-size"),
+        ("min_teachers_per_item", "--min-teachers-per-item"),
         ("seed", "--seed"),
         ("batch_size", "--batch-size"),
         ("dtype", "--dtype"),

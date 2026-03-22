@@ -23,6 +23,9 @@
 - `configs/rsr_pipeline.example_rsr.json`
   - explicit RSR batch config
 
+- `configs/rsr_pipeline.example_rsr_item.json`
+  - explicit item-level RSR batch config
+
 - `configs/rsr_pipeline_example_test_grace.json`
   - tiny GRACE dry-run config
 
@@ -82,6 +85,14 @@ python rsr_pipeline.py \
   --output-root outputs/pipeline_runs
 ```
 
+For item-level RSR, use:
+
+```bash
+python rsr_pipeline.py \
+  --config configs/rsr_pipeline.example_rsr_item.json \
+  --output-root outputs/pipeline_runs
+```
+
 ## Config Notes
 
 - `defaults`
@@ -102,6 +113,7 @@ python rsr_pipeline.py \
     - `dataset_export_dir`
     - `selection_metric`
     - `sample_size`
+    - `min_teachers_per_item`
     - `seed`
     - `batch_size`
     - `dtype`
@@ -124,7 +136,9 @@ python rsr_pipeline.py \
 
 If `runs` is omitted, `rsr_pipeline.py` uses the full dataset × model cross product.
 
-Supported `selection_metric` values are `rsr`, `grace`, `g_norm`, and `g_vendi`. For paper-style GRACE runs, use `batch_size=1`, `sample_size=200`, `grace_projection_dim=512`, and `grace_num_partitions=10`.
+Supported `selection_metric` values are `rsr`, `rsr_item`, `grace`, `g_norm`, and `g_vendi`. For paper-style GRACE runs, use `batch_size=1`, `sample_size=200`, `grace_projection_dim=512`, and `grace_num_partitions=10`.
+
+`rsr_item` is also supported. It keeps the per-teacher RSR scoring step, but the final dataset is built item-by-item: for each eligible id, the lowest-RSR teacher response is selected from the available candidates. Use `min_teachers_per_item` to require a minimum number of teacher answers before an item is eligible. `rsr_item` does not use `sample_size`; it scores all eligible ids.
 
 Recommended practice is to keep separate config files for `grace` and `rsr`, because the metric-specific parameters and export directories are different. This repo now includes:
 
